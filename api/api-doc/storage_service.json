@@ -2740,6 +2740,18 @@
       "sstable":{
         "id":"sstable",
         "properties":{
+            "name":{
+               "type":"string",
+               "description":"File name of sstable"
+            },
+            "droppable_tombstone_ratio":{
+               "type":"double",
+               "description":"Droppable tombstone ratio of sstable"
+            },
+            "tombstone_ratio":{
+               "type":"double",
+               "description":"Total tombstone ratio of sstable"
+            },
             "size":{
                "type":"long",
                "description":"Total size in bytes of sstable"
@@ -2800,6 +2812,21 @@
             },
             "table":{
                 "type":"string"
+            },
+            "tombstone_count":{
+               "type":"long"
+            },
+            "droppable_tombstone_count":{
+               "type":"double"
+            },
+            "row_count":{
+               "type":"long"
+            },
+            "tombstone_ratio":{
+               "type":"double"
+            },
+            "droppable_tombstone_ratio":{
+               "type":"double"
             },
             "sstables":{
                 "type":"array",

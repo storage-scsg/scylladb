@@ -150,6 +150,14 @@ struct streaming_histogram {
         return sum;
     }
 
+    uint64_t sum() const {
+        uint64_t sum = 0;
+        for (auto& e : bin) {
+            sum += e.second;
+        }
+        return sum;
+    }
+
     // FIXME: convert Java code below.
 #if 0
     public Map<Double, Long> getAsMap()

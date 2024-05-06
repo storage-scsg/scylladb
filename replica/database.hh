@@ -339,6 +339,11 @@ struct table_stats {
     int64_t live_disk_space_used = 0;
     int64_t total_disk_space_used = 0;
     int64_t live_sstable_count = 0;
+<<<<<<< HEAD
+=======
+    int64_t estimated_row_count = 0;
+    int64_t estimated_tombstone_count = 0;
+>>>>>>> c8594115b8 (feat: support for counting tombstone for table)
     /** Estimated number of compactions pending for this column family */
     int64_t pending_compactions = 0;
     int64_t memtable_partition_insertions = 0;
@@ -567,6 +572,7 @@ private:
         return _config.enable_cache && _schema->caching_options().enabled();
     }
     void update_stats_for_new_sstable(const sstables::shared_sstable& sst) noexcept;
+    void update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, uint64_t estimated_row_count_by_sstable, uint64_t estimated_tombstone_count_by_sstable) noexcept;
     future<> do_add_sstable_and_update_cache(sstables::shared_sstable sst, sstables::offstrategy offstrategy);
     // Helpers which add sstable on behalf of a compaction group and refreshes compound set.
     void add_sstable(compaction_group& cg, sstables::shared_sstable sstable);

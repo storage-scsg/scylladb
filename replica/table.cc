@@ -464,6 +464,14 @@ void table::notify_bootstrap_or_replace_end() {
     trigger_offstrategy_compaction();
 }
 
+void table::update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, uint64_t estimated_row_count_by_sstable, uint64_t estimated_tombstone_count_by_sstable) noexcept {
+    _stats.live_disk_space_used += disk_space_used_by_sstable;
+    _stats.total_disk_space_used += disk_space_used_by_sstable;
+    _stats.live_sstable_count++;
+    _stats.estimated_row_count += estimated_row_count_by_sstable;
+    _stats.estimated_tombstone_count += estimated_tombstone_count_by_sstable;
+}
+
 inline void table::add_sstable_to_backlog_tracker(compaction_backlog_tracker& tracker, sstables::shared_sstable sstable) {
     tracker.replace_sstables({}, {std::move(sstable)});
 }
@@ -491,7 +499,7 @@ compaction_group::do_add_sstable(lw_shared_ptr<sstables::sstable_set> sstables, 
     }
     // update sstable set last in case either updating
     // staging sstables or backlog tracker throws
-    _t.update_stats_for_new_sstable(sstable->bytes_on_disk(), sstable->get_stats_metadata().rows_count);
+    _t.update_stats_for_new_sstable(sstable->bytes_on_disk(), sstable->get_stats_metadata().rows_count, sstable->get_stats_metadata().estimated_tombstone_drop_time.sum());
     return new_sstables;
 }
 
@@ -1176,6 +1184,14 @@ void table::set_metrics() {
             }
         }
     }
+    if (_config.enable_estimated_row_count_reporting) {
+        _metrics.add_group("column_family", {
+                ms::make_gauge("estimated_row_count", ms::description("Estimated row count"), _stats.estimated_row_count)(cf)(ks),
+        });
+        _metrics.add_group("column_family", {
+                ms::make_gauge("estimated_tombstone_count", ms::description("Estimated tombstone count"), _stats.estimated_tombstone_count)(cf)(ks),
+        });
+    }
 }
 
 void table::deregister_metrics() {
@@ -1210,7 +1226,7 @@ void table::rebuild_statistics() {
     _stats.total_disk_space_used = 0;
 
     _sstables->for_each_sstable([this] (const sstables::shared_sstable& tab) {
-        update_stats_for_new_sstable(tab->bytes_on_disk(), tab->get_stats_metadata().rows_count);
+        update_stats_for_new_sstable(tab->bytes_on_disk(), tab->get_stats_metadata().rows_count, tab->get_stats_metadata().estimated_tombstone_drop_time.sum());
     });
     for (const compaction_group_ptr& cg : compaction_groups()) {
         _stats.live_disk_space_used += cg->live_disk_space_used();

@@ -8,6 +8,7 @@ import pytest
 from botocore.exceptions import ClientError
 from decimal import Decimal
 from util import random_string, random_bytes
+import requests
 
 # Basic test for creating a new item with a random name, and reading it back
 # with strong consistency.
@@ -806,3 +807,30 @@ def test_update_item_delete_nonexistent_attribute(test_table_s):
     test_table_s.put_item(Item={'p': p, 'a': 'hello'})
     test_table_s.update_item(Key={'p': p}, AttributeUpdates={'b': {'Action': 'DELETE'}})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hello'}
+
+def test_tombstone_count(filled_test_table, rest_api):
+    table, _ = filled_test_table
+    cf = table.name
+    requests.post(rest_api+'/storage_service/keyspace_flush/alternator_'+cf, params={'cf' : cf})
+    sstable_resp = requests.get(rest_api+'/storage_service/sstable_info?keyspace=alternator_'+cf+'&cf='+cf)
+    assert sstable_resp.json()[0]['tombstone_count'] == 329
+    items = [{
+        'p': str(i),
+        'c': str(i),
+        'attribute': "x" * 7,
+        'another': "y" * 16
+    } for i in range(164,328)]
+    with table.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    with table.batch_writer() as batch:
+        for i in range(164,328):
+            batch.delete_item(
+                Key={
+                    'p': str(i),
+                    'c': str(i)
+                }
+            )
+    requests.post(rest_api+'/storage_service/keyspace_flush/alternator_'+cf, params={'cf' : cf})
+    sstable_resp = requests.get(rest_api+'/storage_service/sstable_info?keyspace=alternator_'+cf+'&cf='+cf)
+    assert sstable_resp.json()[0]['tombstone_count'] == 493

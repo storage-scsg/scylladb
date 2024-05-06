@@ -1292,6 +1292,16 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
                             i->sstables.push(std::move(sd));
                         }
                     }
+                    i->tombstone_count = i->tombstone_count() + t.tombstone_count();
+                    i->droppable_tombstone_count = i->droppable_tombstone_count() + t.droppable_tombstone_count();
+                    i->row_count = i->row_count() + t.row_count();
+                    if (i->row_count()) {
+                        i->tombstone_ratio = static_cast<double>(i->tombstone_count()) / i->row_count();
+                        i->droppable_tombstone_ratio = i->droppable_tombstone_count() / i->row_count();
+                    } else {
+                        i->tombstone_ratio = 0;
+                        i->droppable_tombstone_ratio = 0;
+                    }
                 }
             }, [ks, cf](const replica::database& db) {
                 // see above
@@ -1306,6 +1316,9 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
                         ss::table_sstables tst;
                         tst.keyspace = schema->ks_name();
                         tst.table = schema->cf_name();
+                        uint64_t tombstone_count = 0;
+                        double droppable_tombstone_count = 0;
+                        uint64_t row_count = 0;
 
                         for (auto sstables = t->get_sstables_including_compacted_undeleted(); auto sstable : *sstables) {
                             auto ts = db_clock::to_time_t(sstable->data_file_write_time());
@@ -1314,6 +1327,7 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
 
                             ss::sstable info;
 
+                            info.name = sstable->get_filename();
                             info.timestamp = t;
                             info.generation = fmt::to_string(sstable->generation());
                             info.level = sstable->get_sstable_level();
@@ -1322,6 +1336,24 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
                             info.index_size = sstable->index_size();
                             info.filter_size = sstable->filter_size();
                             info.version = sstable->get_version();
+
+                            auto& st = sstable->get_stats_metadata();
+                            uint64_t sstable_tombstone_count = st.estimated_tombstone_drop_time.sum();
+                            uint64_t sstable_row_count = st.rows_count;
+                            tombstone_count += sstable_tombstone_count;
+                            row_count += sstable_row_count;
+
+                            auto s = sstable->get_schema();
+                            auto gc_before = gc_clock::now() - s->gc_grace_seconds();
+                            double sstable_droppable_tombstone_count = st.estimated_tombstone_drop_time.sum(gc_before.time_since_epoch().count());
+                            droppable_tombstone_count += sstable_droppable_tombstone_count;
+                            if (sstable_row_count) {
+                                info.droppable_tombstone_ratio = sstable_droppable_tombstone_count / sstable_row_count;
+                                info.tombstone_ratio = static_cast<double>(sstable_tombstone_count) / sstable_row_count;
+                            } else {
+                                info.droppable_tombstone_ratio = 0;
+                                info.tombstone_ratio = 0;
+                            }
 
                             if (sstable->has_component(sstables::component_type::CompressionInfo)) {
                                 auto& c = sstable->get_compression();
@@ -1378,6 +1410,9 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
 
                             tst.sstables.push(std::move(info));
                         }
+                        tst.tombstone_count = tombstone_count;
+                        tst.droppable_tombstone_count = droppable_tombstone_count;
+                        tst.row_count = row_count;
                         res.emplace_back(std::move(tst));
                     }
                 });
