@@ -62,6 +62,15 @@
 #include "repair/reader.hh"
 #include "compaction/compaction_manager.hh"
 #include "utils/xx_hasher.hh"
+#include "query-result-writer.hh"
+#include "query-request.hh"
+#include "mutation/mutation_compactor.hh"
+#include "alternator/executor.hh"
+#include "cql3/selection/selection.hh"
+#include <seastar/coroutine/as_future.hh>
+#include "seastar/coroutine/exception.hh"
+#include <seastar/core/when_all.hh>
+#include "service/storage_service.hh"
 
 extern logging::logger rlogger;
 
@@ -182,6 +191,37 @@ struct row_level_repair_metrics {
     uint64_t row_from_disk_bytes{0};
     uint64_t tx_hashes_nr{0};
     uint64_t rx_hashes_nr{0};
+    struct {
+        utils::UUID repair_uuid;
+        lowres_clock::time_point start_time;
+        uint64_t total_row_num;
+        uint64_t total_data_size;
+        uint64_t synced_row_nr_per_sec;
+    } synced_row_nr_meta;
+
+    void init_synced_row_nr_meta(utils::UUID id) {
+        if (synced_row_nr_meta.repair_uuid == id) {
+            return;
+        }
+        synced_row_nr_meta.repair_uuid = id;
+        synced_row_nr_meta.start_time = lowres_clock::now();
+        synced_row_nr_meta.total_row_num = 0;
+        synced_row_nr_meta.total_data_size = 0;
+        return;
+    }
+
+    void update_synced_row_nr_meta(uint64_t row_num, uint64_t tansported_data_size) {
+        synced_row_nr_meta.total_row_num += row_num;
+        synced_row_nr_meta.total_data_size += tansported_data_size;
+        return;
+    }
+
+    void calculate_srps() {
+        auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - synced_row_nr_meta.start_time).count();
+        synced_row_nr_meta.synced_row_nr_per_sec = (uint64_t)(float(synced_row_nr_meta.total_row_num) / duration);
+        return;
+    }
+
     row_level_repair_metrics() {
         namespace sm = seastar::metrics;
         _metrics.add_group("repair", {
@@ -201,6 +241,12 @@ struct row_level_repair_metrics {
                             sm::description("Total number of rows read from disk on this shard.")),
             sm::make_counter("row_from_disk_bytes", row_from_disk_bytes,
                             sm::description("Total bytes of rows read from disk on this shard.")),
+            sm::make_counter("synced_row_nr", synced_row_nr_meta.total_row_num,
+                            sm::description("Total number of rows synced on this shard, this value valid during repair process.")),
+            sm::make_counter("total_data_size", synced_row_nr_meta.total_data_size,
+                            sm::description("Total data size for synctable transported on this shard, this value valid during repair process.")),
+            sm::make_counter("srps", synced_row_nr_meta.synced_row_nr_per_sec,
+                            sm::description("synced num of rows per second, this value valid during repair process.")),
         });
     }
 };
@@ -764,6 +810,7 @@ private:
     repair_hasher _repair_hasher;
     gc_clock::time_point _compaction_time;
     reader_concurrency_semaphore::inactive_read_handle _fake_inactive_read_handle;
+    tasks::task_id _repair_task_id;
 public:
     std::vector<repair_node_state>& all_nodes() {
         return _all_node_states;
@@ -819,7 +866,8 @@ public:
             inet_address_vector_replica_set all_live_peer_nodes,
             size_t nr_peer_nodes,
             row_level_repair* row_level_repair_ptr,
-            gc_clock::time_point compaction_time)
+            gc_clock::time_point compaction_time,
+            tasks::task_id repair_task_id = {})
             : _rs(rs)
             , _db(rs.get_db())
             , _messaging(rs.get_messaging())
@@ -857,6 +905,7 @@ public:
             , _row_level_repair_ptr(row_level_repair_ptr)
             , _repair_hasher(_seed, _schema)
             , _compaction_time(compaction_time)
+            , _repair_task_id(repair_task_id)
             {
             if (master) {
                 add_to_repair_meta_for_masters(*this);
@@ -1925,6 +1974,396 @@ public:
             return apply_rows_on_follower(std::move(rows));
         });
     }
+
+// ----------- for repair synctable ---------------
+public:
+    std::optional<bool> _synctable_flag = std::nullopt;
+private:
+    class data_query_result_builder {
+    public:
+        using result_type = query::result;
+
+    private:
+        const compact_for_query_state_v2& _compaction_state;
+        std::unique_ptr<query::result::builder> _res_builder;
+        query_result_builder _builder;
+
+    public:
+        data_query_result_builder(const schema& s, const query::partition_slice& slice, query::result_options opts,
+                query::result_memory_accounter&& accounter, const compact_for_query_state_v2& compaction_state, uint64_t tombstone_limit)
+            : _compaction_state(compaction_state)
+            , _res_builder(std::make_unique<query::result::builder>(slice, opts, std::move(accounter), tombstone_limit))
+            , _builder(s, *_res_builder) { }
+
+        void consume_new_partition(const dht::decorated_key& dk) { _builder.consume_new_partition(dk); }
+        void consume(tombstone t) { _builder.consume(t); }
+        stop_iteration consume(static_row&& sr, tombstone t, bool is_alive) { return _builder.consume(std::move(sr), t, is_alive); }
+        stop_iteration consume(clustering_row&& cr, row_tombstone t, bool is_alive) { return _builder.consume(std::move(cr), t, is_alive); }
+        stop_iteration consume(range_tombstone_change&& rtc) { return _builder.consume(std::move(rtc)); }
+        stop_iteration consume_end_of_partition()  { return _builder.consume_end_of_partition(); }
+        result_type consume_end_of_stream() {
+            _builder.consume_end_of_stream();
+            if (_compaction_state.are_limits_reached() || _res_builder->is_short_read()) {
+                return _res_builder->build(_compaction_state.current_full_position());
+            }
+            return _res_builder->build();
+        }
+    };
+
+    struct synctable_repair_row {
+        lw_shared_ptr<const decorated_key_with_hash> dk_with_hash;
+        repair_sync_boundary boundary;
+        lw_shared_ptr<mutation_fragment> mf;
+    };
+
+    struct sycntable_consumer_adapter {
+        std::list<synctable_repair_row>::iterator& _curr;
+        std::list<synctable_repair_row>::iterator _end;
+        std::optional<dht::decorated_key> _decorated_key;
+        compact_for_query_v2<data_query_result_builder> _consumer;
+
+        bool _new_page_flag;
+        bool _in_partition; // false means no need to consume missing partition_end and vice versa.
+    
+        sycntable_consumer_adapter(std::list<synctable_repair_row>::iterator& start,
+                std::list<synctable_repair_row>::iterator end, compact_for_query_v2<data_query_result_builder> c)
+            : _curr(start)
+            , _end(end)
+            , _consumer(std::move(c))
+            , _new_page_flag(true)
+            , _in_partition(false) { }
+
+        future<stop_iteration> operator()(mutation_fragment_v2&& mf) {
+            return std::move(mf).consume(*this);
+        }
+        future<stop_iteration> operator()(mutation_fragment&& mf) {
+            return std::move(mf).consume(*this);
+        }
+        future<stop_iteration> consume(static_row&& sr) {
+            return handle_result(_consumer.consume(std::move(sr)));
+        }
+        future<stop_iteration> consume(clustering_row&& cr) {
+            return handle_result(_consumer.consume(std::move(cr)));
+        }
+
+        // for alternator table data, there should not be any range_tombstone data.
+        future<stop_iteration> consume(range_tombstone_change&& rt) {
+            return handle_result(_consumer.consume(std::move(rt)));
+        }
+        future<stop_iteration> consume(range_tombstone&& rt) {
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        }
+        future<stop_iteration> consume(partition_start&& ps) {
+            _decorated_key.emplace(std::move(ps.key()));
+            _consumer.consume_new_partition(*_decorated_key);
+            if (ps.partition_tombstone()) {
+                _consumer.consume(ps.partition_tombstone());
+            }
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        }
+        future<stop_iteration> consume(partition_end&& pe) {
+            return futurize_invoke([this] {
+                return _consumer.consume_end_of_partition();
+            });
+        }
+    private:
+        future<stop_iteration> handle_result(stop_iteration si) {
+            if (si) {
+                if (_consumer.consume_end_of_partition()) {
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                }
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        }
+    };
+
+    struct synctable_common_param {
+        const lw_shared_ptr<service::storage_proxy::synctable_within_repair_config> cfg;
+        query::partition_slice slice;
+        std::optional<alternator::attrs_to_get> attrs;
+        shared_ptr<cql3::selection::selection> selection;
+        shared_ptr<dynamodb::client> synctable_http_client;
+    };
+
+    lw_shared_ptr<compact_for_query_state_v2> _synctable_compaction_state = nullptr;
+    lw_shared_ptr<synctable_common_param> _synctable_common_param = nullptr;
+    // static constexpr uint64_t _synctable_row_limit = static_cast<uint64_t>(query::row_limit::max);
+    // the maximum data size for data-transfer-to-json-format is 400KB. we assume that each data size is 4KB so the total row limit is 100.
+    uint32_t _synctable_row_limit = 100;
+
+    future<> synctable_consume_pausable(sycntable_consumer_adapter& consumer, partition_region first_fragment_region) {
+        return repeat([this, &consumer, first_fragment_region] () mutable {
+            // data exhausted. we have to add missing partition_end in repair process.
+            if (consumer._curr == consumer._end) {
+                mutation_fragment_v2 missing_partition_end(*_schema, _permit, partition_end());
+                consumer._in_partition = false;
+                (void)consumer(std::move(missing_partition_end));
+                return make_ready_future<stop_iteration>(stop_iteration::yes);
+            }
+
+            synctable_repair_row& r = *(consumer._curr);
+            const auto curr_fragment_region = r.boundary.position.region(); 
+
+            // to make sure that the new page will start with consumer(partition_start).
+            // new page do not need to consume missing partition_end.
+            if (consumer._new_page_flag) {
+                consumer._new_page_flag = false;
+                // the first mf is partition_start, or there is a missing partiton_start.
+                if (first_fragment_region == partition_region::partition_start) {
+                    // consume the missing partiton_start.
+                    if (curr_fragment_region != partition_region::partition_start) {
+                        partition_start ps(r.dk_with_hash->dk, tombstone());
+                        mutation_fragment_v2 missing_partition_start(*_schema, _permit, std::move(ps));
+                        consumer._in_partition = true;
+                        return consumer(std::move(missing_partition_start));
+                    } else {
+                        // the first partition_start for the new page do not need to consume missing partition_end.
+                        consumer._in_partition = false;
+                    }
+                // first_fragment_region != partition_start means the partition start for the current data-row
+                // has been consumed. so we set _in_partition to be true, so that when encountered with the next 
+                // missing partition_start, we will know there is a missing partition_end before it.
+                } else {
+                    consumer._in_partition = true;
+                }
+            }
+
+            // get_missing_partiton_fragment.
+            if (curr_fragment_region == partition_region::partition_start) {
+                if (consumer._in_partition) {
+                    mutation_fragment_v2 missing_partition_end(*_schema, _permit, partition_end());
+                    consumer._in_partition = false;
+                    return consumer(std::move(missing_partition_end));
+                }
+            } else {
+                // curr_dk is immpossible to be nullptr because the partition_start will be definately consumed before
+                // any data-row consumption.
+                const dht::decorated_key* curr_dk = _synctable_compaction_state->current_partition();
+                if (!(*curr_dk).equal(*_schema, r.dk_with_hash->dk)) {
+                    // consume missing partition_end.
+                    if (consumer._in_partition) {
+                        mutation_fragment_v2 missing_partition_end(*_schema, _permit, partition_end());
+                        consumer._in_partition = false;
+                        return consumer(std::move(missing_partition_end));
+                    // consume missing partition_start.
+                    } else {
+                        partition_start ps(r.dk_with_hash->dk, tombstone());
+                        mutation_fragment_v2 missing_partition_start(*_schema, _permit, std::move(ps));
+                        consumer._in_partition = true;
+                        return consumer(std::move(missing_partition_start));
+                    }
+                }
+            }
+
+            consumer._curr++;
+            return consumer(std::move(*(r.mf)));
+        });
+    }
+
+    auto synctable_consume_new_page(std::list<synctable_repair_row>::iterator& buf_start, std::list<synctable_repair_row>::iterator buf_end) {
+        query::partition_slice& slice = _synctable_common_param->slice;
+
+        const auto short_read_allowed = query::short_read(slice.options.contains<query::partition_slice::option::allow_short_read>());
+        auto accounter = _db.local().get_result_memory_limiter().new_mutation_read(_rs.get_storage_proxy().local().get_max_result_size(slice), short_read_allowed).get();
+        query::result_options query_result_opts = {query::result_request::only_result, query::digest_algorithm::none};
+        data_query_result_builder builder(*_schema, slice, query_result_opts, std::move(accounter), *_synctable_compaction_state, static_cast<uint64_t>(query::tombstone_limit::max));
+
+        const synctable_repair_row &first_repair_row = *buf_start;
+        auto first_fragment_region = first_repair_row.boundary.position.region();
+        // 判断是否有隐藏的partition_start
+        if (first_fragment_region != partition_region::partition_start) {
+            const dht::decorated_key* curr_dk = _synctable_compaction_state->current_partition();
+            if (!curr_dk || !((*curr_dk).equal(*_schema, first_repair_row.dk_with_hash->dk))) {
+                first_fragment_region = partition_region::partition_start;
+            }
+        }
+        _synctable_compaction_state->start_new_page(_synctable_row_limit, static_cast<uint32_t>(query::partition_limit::max), gc_clock::now(), first_fragment_region, builder);
+
+        auto buffer_consumer = compact_for_query_v2<data_query_result_builder>(_synctable_compaction_state, std::move(builder));
+    
+        return do_with(sycntable_consumer_adapter(buf_start, buf_end, std::move(buffer_consumer)),
+            [this, first_fragment_region] (sycntable_consumer_adapter& adapter) mutable {
+            return synctable_consume_pausable(adapter, first_fragment_region).then([&adapter] () mutable {
+                return adapter._consumer.consume_end_of_stream();
+            });
+        });
+    }
+
+    future<> construct_synctable_repair_list(std::list<repair_row>& rows, std::list<synctable_repair_row>& compacted_rows) {
+        auto cmp = position_in_partition::tri_compare(*_schema);
+        lw_shared_ptr<synctable_repair_row> last_row;
+
+        for (auto& r : rows) {
+            co_await coroutine::maybe_yield();
+
+            // get mutation fragment with no dependence.
+            frozen_mutation_fragment& fmf = r.get_frozen_mutation();
+            mutation_fragment mf_value = fmf.unfreeze(*_schema, _permit);
+            lw_shared_ptr<mutation_fragment> mf = make_lw_shared<mutation_fragment>(std::move(mf_value));
+
+            // construct curr repaired row
+            synctable_repair_row curr_row_value = {r.get_dk_with_hash(), r.boundary(), mf};
+            lw_shared_ptr<synctable_repair_row> curr_row = make_lw_shared<synctable_repair_row>(std::move(curr_row_value));
+
+            const auto& dk = curr_row->dk_with_hash->dk;
+
+            if (last_row && cmp(last_row->mf->position(), mf->position()) == 0 &&
+                dk.tri_compare(*_schema, last_row->dk_with_hash->dk) == 0 && last_row->mf->mergeable_with(*mf)) {
+                // merge duplicated data.
+                last_row->mf->apply(*_schema, std::move(*mf));
+            } else {
+                if (last_row) {
+                    compacted_rows.push_back(std::move(*last_row));
+                }
+                last_row = curr_row;
+            }
+        }
+        if (last_row) {
+            compacted_rows.push_back(std::move(*last_row));
+        }
+        co_return co_await make_ready_future<>();
+    }
+
+public:
+    future<int> synctable_in_repair(bool use_working_row_buf) {
+        // only incremental sync-repair will run this part while the fully sync will throw error when sync fail.
+        if (_synctable_flag.has_value()) {
+            if (!_synctable_flag.value()) {
+                co_return co_await make_ready_future<int>(0);
+            }
+        }
+
+        // init synctable param.
+        if (!_synctable_flag.has_value()) {
+            const sstring& ks_name = _schema->ks_name();
+            const sstring& cf_name = _schema->cf_name();
+            sstring expected_table_name = ks_name.substr(ks_name.find('_') + 1);
+            // only base table need to be synced (for incremental repair-sync, fully repair-sync need to designate the base table name).
+            if (cf_name != expected_table_name) {
+                _synctable_flag = false;
+                co_return co_await make_ready_future<int>(0);
+            }
+
+            service::storage_proxy& local_sp = _rs.get_storage_proxy().local();
+            const lw_shared_ptr<service::storage_proxy::synctable_within_repair_config> cfg = local_sp.get_synctable_repair_cfg(_repair_task_id);
+            // only normal nodetool repair has no cfg.
+            if (!cfg) {
+                _synctable_flag = false;
+                co_return co_await make_ready_future<int>(0);
+            }
+
+            if (!_synctable_common_param) {
+                std::optional<alternator::attrs_to_get> attrs = std::nullopt;
+                const auto projection = cfg->opts.contains<service::storage_proxy::synctable_option::projection>();
+                bool skip_regular_columns = true;
+                std::vector<const column_definition*> cds;
+
+                if (projection) {
+                    alternator::attrs_to_get maps;
+                    for (sstring& attr : cfg->attrs) {
+                        using node = alternator::attribute_path_map_node<std::monostate>;
+                        auto it = maps.find(attr);
+                        if (it == maps.end()) {
+                            maps.emplace(attr, node {});
+                            const column_definition* cd = _schema->get_column_definition(to_bytes(attr));
+                            // if cd == nullptr, it means cd is a part of :attrs (or an invalid column name whatever). otherwise, its a part of primary key.
+                            if (cd != nullptr) {
+                                cds.emplace_back(cd);
+                            } else if (skip_regular_columns) {
+                                skip_regular_columns = false;
+                            }
+                        }
+                    }
+                    attrs.emplace(std::move(maps));
+                } else {
+                    skip_regular_columns = false;
+                }
+
+                std::vector<query::clustering_range> ck_bounds{query::clustering_range::make_open_ended_both_sides()};
+                query::column_id_vector regular_columns;
+                shared_ptr<cql3::selection::selection> selection;
+                if (skip_regular_columns) {
+                    regular_columns = {};
+                    selection = cql3::selection::selection::for_columns(_schema, cds);
+                    // if no data need to be transfered, we can increase _synctable_row_limit to 2000.
+                    _synctable_row_limit = std::min(uint32_t(2000), cfg->batch_row_limit);
+                } else {
+                    regular_columns = boost::copy_range<query::column_id_vector>(
+                        _schema->regular_columns() | boost::adaptors::filtered([] (const column_definition& cdef) { return !cdef.is_view_virtual();}) | boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.id; }));
+                    selection = cql3::selection::selection::wildcard(_schema);
+                    _synctable_row_limit = std::min(_synctable_row_limit, cfg->batch_row_limit);
+                }
+
+                query::partition_slice::option_set curr_opts = selection->get_query_options();
+                curr_opts.add(query::partition_slice::option_set());
+                auto slice = query::partition_slice(std::move(ck_bounds), {}, std::move(regular_columns), curr_opts);
+                slice.options.set<query::partition_slice::option::allow_short_read>();
+
+                auto synctable_http_client = local_sp.find_or_create_dynamodb_client(cfg->destips[0].first, cfg->destips[0].second);
+                synctable_common_param synctable_common_param_value = {cfg, std::move(slice), std::move(attrs), selection, synctable_http_client};
+                _synctable_common_param = make_lw_shared<synctable_common_param>(std::move(synctable_common_param_value));
+            }
+
+            if (!_synctable_compaction_state) {
+                _synctable_compaction_state = make_lw_shared<compact_for_query_state_v2>(*_schema, gc_clock::now(), _synctable_common_param->slice, _synctable_row_limit, static_cast<uint32_t>(query::partition_limit::max));
+            }
+            _metrics.init_synced_row_nr_meta(_repair_task_id.uuid());
+            _synctable_flag = true;
+        }
+
+        std::list<repair_row>& row_buf = use_working_row_buf ?  _working_row_buf : _row_buf;
+        if (row_buf.size() == 0) {
+            co_return co_await make_ready_future<int>(0);
+        }
+
+        std::vector<future<>> res;
+        std::list<synctable_repair_row> compacted_rows;
+        co_await construct_synctable_repair_list(row_buf, compacted_rows);
+
+        auto it = compacted_rows.begin();
+        while (it != compacted_rows.end()) {
+            // Use coroutine::as_future to prevent exception on timesout.
+            auto f = co_await coroutine::as_future(synctable_consume_new_page(it, compacted_rows.end()));
+            if (!f.failed()) {
+                query::result query_result = std::move(f).get0();
+                std::vector<rjson::value> json_items = co_await alternator::executor::transfer_query_result_to_json(_schema, _synctable_common_param->slice, _synctable_common_param->selection, query_result, _synctable_common_param->attrs);
+                uint32_t row_num = json_items.size();
+
+                rjson::value items;
+                items = alternator::get_batch_write_item_format(std::move(json_items), _synctable_common_param->cfg->target_table_name, _synctable_common_param->cfg->altered_columns);
+                std::string temp_data = rjson::print(items);
+                _metrics.update_synced_row_nr_meta(row_num, temp_data.length());
+                temporary_buffer<char> transport_data(temp_data.c_str(), temp_data.length());
+                res.push_back(_synctable_common_param->synctable_http_client->operate(std::move(transport_data), dynamodb::client::opcode_type::batch_write_item));
+            } else {
+                rlogger.error("synctable_consume_new_page failed {}", f.get_exception());
+                // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
+                _synctable_flag = false;
+                // if its incr_ysnc, just ignore the sync error.
+                if (_synctable_common_param->cfg->incr_sync) {
+                    co_return co_await make_ready_future<int>(0);
+                }
+                co_return co_await make_ready_future<int>(1);
+            }
+        }
+
+        if (res.size() == 0) {
+            co_return co_await make_ready_future<int>(0);
+        }
+
+        co_await seastar::when_all_succeed(res.begin(), res.end()).discard_result().handle_exception([this] (auto ep) {
+            rlogger.error("synctable_send_data failed: {}", ep);
+            // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
+            _synctable_flag = false;
+            return make_ready_future<>();
+        });
+
+        if (_synctable_common_param->cfg->incr_sync == false && _synctable_flag.value() == false) {
+            co_return co_await make_ready_future<int>(1);
+        }
+        co_return co_await make_ready_future<int>(0);
+    }
 };
 
 // Must run inside a seastar thread
@@ -2606,6 +3045,10 @@ private:
                 _skipped_sync_boundary = _common_sync_boundary;
                 rlogger.debug("Skip set skipped_sync_boundary={}", _skipped_sync_boundary);
                 master.stats().round_nr_fast_path_already_synced++;
+                int sync_res = master.synctable_in_repair(false).get();
+                if (sync_res) {
+                    throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
+                }
                 return op_status::next_round;
             } else {
                 _skipped_sync_boundary = std::nullopt;
@@ -2664,6 +3107,10 @@ private:
             // `_working_row_buf` on all the nodes are the same
             // This is the second fast path.
             master.stats().round_nr_fast_path_same_combined_hashes++;
+            int sync_res = master.synctable_in_repair(true).get();
+            if (sync_res) {
+                throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
+            }
             return op_status::next_round;
         }
 
@@ -2755,6 +3202,11 @@ private:
                     _shard_task.global_repair_id.uuid(), node, s->ks_name(), s->cf_name(), _range, std::current_exception());
             throw;
           }
+        }
+
+        int sync_res = master.synctable_in_repair(true).get();
+        if (sync_res) {
+            throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
         }
         master.flush_rows_in_working_row_buf();
         return op_status::next_step;
@@ -2888,7 +3340,8 @@ public:
                     _all_live_peer_nodes,
                     _all_live_peer_nodes.size(),
                     this,
-                    compaction_time);
+                    compaction_time,
+                    _shard_task.global_repair_id.uuid());
             auto auto_stop_master = defer([&master] {
                 master.stop().handle_exception([] (std::exception_ptr ep) {
                     rlogger.warn("Failed auto-stopping Row Level Repair (Master): {}. Ignored.", ep);
@@ -2970,6 +3423,10 @@ public:
                         _shard_task.global_repair_id.uuid(), this_shard_id(), _shard_task.get_keyspace(), _cf_name, _range, e);
                 // In case the repair process fail, we need to call repair_row_level_stop to clean up repair followers
                 _failed = true;
+            }
+
+            if (master._synctable_flag.has_value() && master._synctable_flag.value() == true) {
+                _metrics.calculate_srps();
             }
 
             parallel_for_each(nodes_to_stop, [&] (const gms::inet_address& node) {

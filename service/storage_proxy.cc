@@ -37,6 +37,8 @@
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/algorithm/cxx11/none_of.hpp>
 #include <boost/algorithm/cxx11/partition_copy.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
 #include <boost/range/algorithm/count_if.hpp>
 #include <boost/range/algorithm/find.hpp>
 #include <boost/range/algorithm/find_if.hpp>
@@ -6569,7 +6571,10 @@ future<> storage_proxy::drain_on_shutdown() {
 
 future<>
 storage_proxy::stop() {
-    return make_ready_future<>();
+    co_await seastar::parallel_for_each(_dynamodb_clients, [] (auto& kv) {
+        return kv.second.client->close();
+    });
+    co_return co_await make_ready_future<>();
 }
 
 locator::token_metadata_ptr storage_proxy::get_token_metadata_ptr() const noexcept {
@@ -6580,4 +6585,81 @@ future<std::vector<dht::token_range_endpoints>> storage_proxy::describe_ring(con
     return locator::describe_ring(_db.local(), _remote->gossiper(), keyspace, include_only_local_dc);
 }
 
+static dynamodb::endpoint_config_ptr make_dynamodb_endpoint_config(unsigned long endpoint_port, bool use_https=false) {
+    dynamodb::endpoint_config cfg = {
+        .port = endpoint_port,
+        .use_https = false,
+        .aws = {{
+            .access_key_id = "Indexer",
+            .secret_access_key = "IndexerFakeKey",
+            .session_token = "IndexerSessionToken",
+            .region = "us-east-1",
+        }},
+    };
+    return make_lw_shared<dynamodb::endpoint_config>(std::move(cfg));
+}
+
+static constexpr int DYNAMODB_HTTP_CLIENT_MEM_SIZE = (16 << 20);
+static constexpr int ENDPOINT_SPLIT_SIZE = 2;
+
+// endpoint format: ip:port
+shared_ptr<dynamodb::client> storage_proxy::find_or_create_dynamodb_client(std::string endpoint) {
+    auto dynamodb_client_wrap_it = _dynamodb_clients.find(endpoint);
+
+    // create new http client.
+    if (dynamodb_client_wrap_it == _dynamodb_clients.end()) {
+        semaphore transport_mem(DYNAMODB_HTTP_CLIENT_MEM_SIZE);
+
+        dynamodb_client_wrap wrap_value = {std::move(transport_mem), nullptr};
+        dynamodb_client_wrap_it = _dynamodb_clients.emplace(endpoint, std::move(wrap_value)).first;
+
+        // split endpoint to ip and port.
+        std::vector<std::string> split_endpoint;
+        boost::algorithm::split(split_endpoint, std::move(endpoint), boost::is_any_of(":"));
+        if (split_endpoint.size() != ENDPOINT_SPLIT_SIZE) {
+            return shared_ptr<dynamodb::client>(nullptr);
+        }
+
+        auto dynamodb_http_client = dynamodb::client::make(std::move(split_endpoint[0]), make_dynamodb_endpoint_config(std::stoul(std::move(split_endpoint[1]))), dynamodb_client_wrap_it->second.transport_mem);
+        dynamodb_client_wrap_it->second.client = dynamodb_http_client;
+    }
+
+    return dynamodb_client_wrap_it->second.client;
+}
+
+// endpoint format: ip:port
+shared_ptr<dynamodb::client> storage_proxy::find_or_create_dynamodb_client(std::string ip, unsigned port) {
+    std::string endpoint = seastar::format("{}:{}", ip, port);
+    auto dynamodb_client_wrap_it = _dynamodb_clients.find(endpoint);
+
+    // create new http client.
+    if (dynamodb_client_wrap_it == _dynamodb_clients.end()) {
+        semaphore transport_mem(DYNAMODB_HTTP_CLIENT_MEM_SIZE);
+
+        dynamodb_client_wrap wrap_value = {std::move(transport_mem), nullptr};
+        dynamodb_client_wrap_it = _dynamodb_clients.emplace(endpoint, std::move(wrap_value)).first;
+
+        auto dynamodb_http_client = dynamodb::client::make(ip, make_dynamodb_endpoint_config(port), dynamodb_client_wrap_it->second.transport_mem);
+        dynamodb_client_wrap_it->second.client = dynamodb_http_client;
+    }
+
+    return dynamodb_client_wrap_it->second.client;
+}
+
+std::optional<std::pair<std::string, unsigned>> validate_and_extract_ip_port(const std::string& input) {
+    boost::smatch matches;
+    boost::regex pattern(R"(^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$)");
+
+    if (boost::regex_match(input, matches, pattern)) {
+        std::string ip = matches[1];
+        unsigned port = std::stoul(matches[2]);
+
+        pattern = R"(^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$)";
+
+        if (boost::regex_match(ip, pattern) && port >= 0 && port <= 65535) {
+            return std::make_pair<std::string, unsigned>(std::move(ip), std::move(port));
+        }
+    }
+    return std::nullopt;
+}
 }

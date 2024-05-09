@@ -4,8 +4,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/metrics.hh>
-#include "utils/http.hh"
-
+#include <seastar/http/client.hh>
 #include "utils/dynamodb/creds.hh"
 
 using namespace seastar;

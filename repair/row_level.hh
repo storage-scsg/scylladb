@@ -232,6 +232,8 @@ public:
 
     friend class repair::user_requested_repair_task_impl;
     friend class repair::data_sync_repair_task_impl;
+
+    sharded<service::storage_proxy>& get_storage_proxy() { return _sp; }
 };
 
 class repair_info;

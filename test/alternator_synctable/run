@@ -9,6 +9,7 @@ import requests
 import time
 import cassandra.cluster
 import cassandra.auth
+import time
 
 # When tests are to be run against AWS (the "--aws" option), it is not
 # necessary to start Scylla at all. All we need to do is to run pytest.
@@ -39,11 +40,13 @@ def run_alternator_cmd(pid, dir, seed_ip=''):
     ip = run.pid_to_ip(pid)
     cmd += [
         '--alternator-address', ip,
-        '--alternator-enforce-authorization', '1',
-        '--alternator-write-isolation', 'always_use_lwt',
-        '--alternator-streams-time-window-s', '0',
+        '--alternator-enforce-authorization', '0',
+        '--alternator-write-isolation', 'o',
         '--alternator-timeout-in-ms', '30000',
-        '--alternator-ttl-period-in-seconds', '0.5',
+        '--alternator-replication-factor', '3',
+        '--alternator-write-consistency-level', 'QUORUM',
+        '--alternator-read-consistency-level', 'QUORUM',
+        '--alternator-query-consistency-level', 'ONE',
         # Allow testing experimental features. Following issue #9467, we need
         # to add here specific experimental features as they are introduced.
         # We only list here Alternator-specific experimental features - CQL
@@ -59,8 +62,6 @@ def run_alternator_cmd(pid, dir, seed_ip=''):
     else:
         cmd += ['--alternator-port', '8000']
     cmd += extra_scylla_options
-    cmd += ['--enable-keyspace-column-family-estimated-row-count', 'true']
-
     return (cmd, env)
 
 pid = run.run_with_temporary_dir(run_alternator_cmd)
@@ -86,6 +87,42 @@ run.wait_for_services(pid, [
     lambda: check_alternator(alternator_url),
 ])
 
+alternator_urls = alternator_url
+
+# follower node start.
+pid_follower1 = run.run_with_temporary_dir(run_alternator_cmd, ip)
+ip_follower1 = run.pid_to_ip(pid_follower1)
+
+if '--https' in sys.argv:
+    alternator_url_follower=f"https://{ip_follower1}:8043"
+else:
+    alternator_url_follower=f"http://{ip_follower1}:8000"
+
+alternator_urls = alternator_urls + ' ' + alternator_url_follower
+
+run.wait_for_services(pid_follower1, [
+    lambda: run.check_cql(ip_follower1),
+    lambda: check_alternator(alternator_url_follower),
+])
+
+# 睡5s, 保证follower1的状态不是unknown. (wait_for_services好像没能保证这一点)
+time.sleep(5)
+
+pid_follower2 = run.run_with_temporary_dir(run_alternator_cmd, ip)
+ip_follower2 = run.pid_to_ip(pid_follower2)
+
+if '--https' in sys.argv:
+    alternator_url_follower=f"https://{ip_follower2}:8043"
+else:
+    alternator_url_follower=f"http://{ip_follower2}:8000"
+
+alternator_urls = alternator_urls + ' ' + alternator_url_follower
+
+run.wait_for_services(pid_follower2, [
+    lambda: run.check_cql(ip_follower2),
+    lambda: check_alternator(alternator_url_follower),
+])
+
 # Set up the the proper authentication credentials needed by the Alternator
 # test. Currently this can only be done through CQL, which is why above we
 # needed to make sure CQL is available.
@@ -94,7 +131,7 @@ cluster.connect().execute("INSERT INTO system_auth.roles (role, salted_hash) VAL
 cluster.shutdown()
 
 # Finally run pytest:
-success = run.run_pytest(sys.path[0], ['--url', alternator_url] + sys.argv[1:])
+success = run.run_pytest(sys.path[0], ['--url', alternator_url, '--urls', alternator_urls] + sys.argv[1:])
 
 run.summary = 'Alternator tests pass' if success else 'Alternator tests failure'
 

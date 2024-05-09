@@ -168,7 +168,7 @@ static bool valid_table_name_chars(std::string_view name) {
 // specifies that table names "names must be between 3 and 255 characters long
 // and can contain only the following characters: a-z, A-Z, 0-9, _ (underscore), - (dash), . (dot)
 // validate_table_name throws the appropriate api_error if this validation fails.
-static void validate_table_name(const std::string& name) {
+void validate_table_name(const std::string& name) {
     if (name.length() < 3 || name.length() > max_table_name_length) {
         throw api_error::validation(
                 format("TableName must be at least 3 characters long and at most {} characters long", max_table_name_length));
@@ -2510,6 +2510,24 @@ future<std::vector<rjson::value>> executor::describe_multi_item(schema_ptr schem
     co_return ret;
 }
 
+future<std::vector<rjson::value>> executor::transfer_query_result_to_json(schema_ptr schema,
+        const query::partition_slice& slice,
+        shared_ptr<cql3::selection::selection> selection,
+        query::result& query_result,
+        std::optional<attrs_to_get>& attrs_to_get) {
+    cql3::selection::result_set_builder builder(*selection, gc_clock::now());
+    query::result_view::consume(query_result, slice, cql3::selection::result_set_builder::visitor(builder, *schema, *selection));
+    auto result_set = builder.build();
+    std::vector<rjson::value> ret;
+    for (auto& result_row : result_set->rows()) {
+        rjson::value item = rjson::empty_object();
+        describe_single_item(*selection, result_row, attrs_to_get, item);
+        ret.push_back(std::move(item));
+        co_await coroutine::maybe_yield();
+    }
+    co_return ret;
+}
+
 static bool check_needs_read_before_write(const parsed::value& v) {
     return std::visit(overloaded_functor {
         [&] (const parsed::constant& c) -> bool {
@@ -4553,4 +4571,16 @@ future<> executor::start() {
     return make_ready_future<>();
 }
 
+void replace_shard_id_to_zero_handler(rjson::value& data) {
+    rjson::allocator the_allocator;
+    std::string str = data.GetString();
+    std::regex regex("\\.\\d+$");
+    std::string replacement = ".0";
+    str = std::regex_replace(str, regex, replacement);
+    data.SetString(std::move(str), the_allocator);
+}
+
+const std::unordered_map<service::storage_proxy::synctable_column_alter_method, std::function<void(rjson::value&)>> alter_method_map = {
+    { service::storage_proxy::synctable_column_alter_method::replace_shard_id_to_zero, replace_shard_id_to_zero_handler },
+};
 }

@@ -36,6 +36,9 @@
 #include "replica/exceptions.hh"
 #include "locator/host_id.hh"
 #include "dht/token_range_endpoints.hh"
+#include "utils/dynamodb/client.hh"
+#include "utils/dynamodb/creds.hh"
+#include "tasks/types.hh"
 
 class reconcilable_result;
 class frozen_mutation_and_schema;
@@ -172,6 +175,11 @@ public:
         // with writes.
         smp_service_group write_ack_smp_service_group = default_smp_service_group();
     };
+    struct dynamodb_client_wrap {
+        semaphore transport_mem;
+        shared_ptr<dynamodb::client> client;
+    };
+    std::unordered_map<std::string, dynamodb_client_wrap> _dynamodb_clients;
 private:
 
     using response_id_type = uint64_t;
@@ -715,6 +723,62 @@ public:
     friend class shared_mutation;
     friend class hint_mutation;
     friend class cas_mutation;
+
+    shared_ptr<dynamodb::client> find_or_create_dynamodb_client(std::string endpoint); // desperated
+    shared_ptr<dynamodb::client> find_or_create_dynamodb_client(std::string ip, unsigned port);
+
+    enum class synctable_column_alter_method {
+        null, // do nothing
+        replace_shard_id_to_zero,
+    };
+
+    enum class synctable_option {
+        fully,
+        projection,
+    };
+    using synctable_option_set = enum_set<super_enum<synctable_option,
+        synctable_option::fully,
+        synctable_option::projection>>;
+
+    struct synctable_within_repair_config {
+        synctable_option_set opts;
+        sstring target_table_name;
+        uint32_t batch_row_limit;
+        std::vector<std::pair<std::string, unsigned>> destips;
+        std::vector<sstring> attrs; // used when projection-option is valid.
+        std::vector<std::pair<sstring, synctable_column_alter_method>> altered_columns;
+        bool incr_sync;
+
+        synctable_within_repair_config () = default;
+        synctable_within_repair_config (synctable_within_repair_config& other_cfg) = default;
+        synctable_within_repair_config (const synctable_within_repair_config& other_cfg) = default;
+        synctable_within_repair_config (synctable_within_repair_config&& other_cfg) = default;
+        synctable_within_repair_config (synctable_option_set o, sstring ttn, int limit, std::vector<std::pair<std::string, unsigned>> ips,
+            std::vector<sstring> a, std::vector<std::pair<sstring, synctable_column_alter_method>> acs, bool incr)
+            : opts(o), target_table_name(std::move(ttn)), batch_row_limit(limit), destips(std::move(ips))
+            , attrs(std::move(a)), altered_columns(std::move(acs)), incr_sync(incr) {}
+    };
+
+    std::unordered_map<utils::UUID, lw_shared_ptr<synctable_within_repair_config>> _synctable_repair_config_map;
+
+    inline future<> insert_synctable_repair_cfg(const tasks::task_id& id, const synctable_within_repair_config& cfg) {
+        _synctable_repair_config_map[id.uuid()] = make_lw_shared<synctable_within_repair_config>(cfg);
+        return make_ready_future<>();
+    }
+
+    inline const lw_shared_ptr<synctable_within_repair_config> get_synctable_repair_cfg(tasks::task_id& id) {
+        auto it = _synctable_repair_config_map.find(id.uuid());
+        if (it != _synctable_repair_config_map.end()) {
+            return it->second;
+        } else {
+            return nullptr;
+        }
+    }
+
+    inline void delete_synctable_repair_cfg(const tasks::task_id& id) {
+        _synctable_repair_config_map.erase(id.uuid());
+    }
 };
 
+std::optional<std::pair<std::string, unsigned>> validate_and_extract_ip_port(const std::string& input);
 }

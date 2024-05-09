@@ -24,7 +24,7 @@ import requests
 def pid_to_dir(pid):
     return os.path.join(os.getenv('TMPDIR', '/tmp'), 'scylla-test-'+str(pid))
 
-def run_with_generated_dir(run_cmd_generator, run_dir_generator):
+def run_with_generated_dir(run_cmd_generator, run_dir_generator, seed_ip=''):
     global run_with_temporary_dir_pids
     global run_pytest_pids
     # Below, there is a small time window, after we fork and the child
@@ -43,7 +43,7 @@ def run_with_generated_dir(run_cmd_generator, run_dir_generator):
         run_pytest_pids = set()
         pid = os.getpid()
         dir = run_dir_generator(pid)
-        (cmd, env) = run_cmd_generator(pid, dir)
+        (cmd, env) = run_cmd_generator(pid, dir, seed_ip)
         # redirect stdout and stderr to log file, as in a shell's >log 2>&1:
         log = os.path.join(dir, 'log')
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, mode=0o666)
@@ -70,8 +70,8 @@ def make_new_tempdir(pid):
     os.mkdir(dir)
     return dir
 
-def run_with_temporary_dir(run_cmd_generator):
-    return run_with_generated_dir(run_cmd_generator, make_new_tempdir)
+def run_with_temporary_dir(run_cmd_generator, seed_ip=''):
+    return run_with_generated_dir(run_cmd_generator, make_new_tempdir, seed_ip)
 
 def restart_with_dir(old_pid, run_cmd_generator, dir):
     try:
@@ -242,8 +242,10 @@ def find_scylla():
         exit(1)
     return scylla
 
-def run_scylla_cmd(pid, dir):
+def run_scylla_cmd(pid, dir, seed_ip=''):
     ip = pid_to_ip(pid)
+    if seed_ip=='':
+        seed_ip = ip
     print('Booting Scylla on ' + ip + ' in ' + dir + '...')
     global scylla
     global source_path
@@ -279,7 +281,7 @@ def run_scylla_cmd(pid, dir):
         '--rpc-address', ip,
         '--listen-address', ip,
         '--prometheus-address', ip,
-        '--seed-provider-parameters', 'seeds=' + ip,
+        '--seed-provider-parameters', 'seeds=' + seed_ip,
         '--workdir', dir,
         '--auto-snapshot', '0',
         '--skip-wait-for-gossip-to-settle', '0',

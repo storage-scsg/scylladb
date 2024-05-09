@@ -47,6 +47,8 @@
 
 #include "idl/position_in_partition.dist.hh"
 #include "idl/partition_checksum.dist.hh"
+#include "service/storage_proxy.hh"
+#include "alternator/executor.hh"
 
 using namespace std::chrono_literals;
 
@@ -502,11 +504,16 @@ future<> repair::task_manager_module::run(repair_uniq_id id, std::function<void 
     return seastar::with_gate(async_gate(), [this, id, func = std::move(func)] () mutable {
         start(id);
         return seastar::async([func = std::move(func)] { func(); }).then([this, id] {
-            rlogger.info("repair[{}]: completed successfully", id.uuid());
+            rlogger.info("repair[{}]: completed successfully, curr time: {} with version 2.0", id.uuid(), db_clock::now());
             done(id, true);
         }).handle_exception([this, id] (std::exception_ptr ep) {
             done(id, false);
             return make_exception_future(std::move(ep));
+        }).finally([this, id] () {
+            auto f = _rs.get_storage_proxy().invoke_on_all([repair_uuid = id.uuid()] (service::storage_proxy& sp) {
+                sp.delete_synctable_repair_cfg(repair_uuid);
+            });
+            rlogger.info("repair[{}]: synctable repair cfg clean complete", id.uuid());
         });
     });
 }
@@ -805,6 +812,14 @@ struct repair_options {
     std::vector<sstring> data_centers;
 
     int ranges_parallelism = -1;
+    // for synctable repair
+    sstring target_table_name = "";
+    std::vector<sstring> ipports;
+    std::vector<sstring> projections;
+    std::vector<sstring> column_alter;
+    std::vector<sstring> column_alter_method;
+    int batch_row_limit;
+    bool incr_sync;
 
     repair_options(std::unordered_map<sstring, sstring> options) {
         bool_opt(primary_range, options, PRIMARY_RANGE_KEY);
@@ -813,6 +828,14 @@ struct repair_options {
         list_opt(hosts, options, HOSTS_KEY);
         list_opt(ignore_nodes, options, IGNORE_NODES_KEY);
         list_opt(data_centers, options, DATACENTERS_KEY);
+        // for synctable repair
+        string_opt(target_table_name, options, TARGET_TABLE_NAME_KEY);
+        list_opt(ipports, options, IP_PORT_LIST_KEY);
+        list_opt(projections, options, PROJECTION_LIST_KEY);
+        list_opt(column_alter, options, COLUMN_ALTER_LIST_KEY);
+        list_opt(column_alter_method, options, COLUMN_ALTER_METHOD_LIST_KEY);
+        int_opt(batch_row_limit, options, BATCH_ROW_LIMIT_INT_KEY);
+        bool_opt(incr_sync, options, INCREMENTAL_SYNCTABLE_BOOL_KEY);
         // We currently do not support incremental repair. We could probably
         // ignore this option as it is just an optimization, but for now,
         // let's make it an error.
@@ -864,6 +887,14 @@ struct repair_options {
     static constexpr const char* START_TOKEN = "startToken";
     static constexpr const char* END_TOKEN = "endToken";
     static constexpr const char* RANGES_PARALLELISM_KEY = "ranges_parallelism";
+    // for synctable repair
+    static constexpr const char* TARGET_TABLE_NAME_KEY = "target_table";
+    static constexpr const char* IP_PORT_LIST_KEY = "ips";
+    static constexpr const char* PROJECTION_LIST_KEY = "projection";
+    static constexpr const char* COLUMN_ALTER_LIST_KEY = "column_alter";
+    static constexpr const char* COLUMN_ALTER_METHOD_LIST_KEY = "column_alter_method";
+    static constexpr const char* BATCH_ROW_LIMIT_INT_KEY = "batch_row_limit";
+    static constexpr const char* INCREMENTAL_SYNCTABLE_BOOL_KEY = "incr_sync";
 
     // Settings of "parallelism" option. Numbers must match Cassandra's
     // RepairParallelism enum, which is used by the caller.
@@ -1082,7 +1113,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     // yet. The id field of repair_uniq_ids returned by next_repair_command()
     // will be >= 1.
     auto id = _repair_module->new_repair_uniq_id();
-    rlogger.info("repair[{}]: starting user-requested repair for keyspace {}, repair id {}, options {}", id.uuid(), keyspace, id.id, options_map);
+    rlogger.info("repair[{}]: starting user-requested repair for keyspace {}, repair id {}, options {}, current time {}", id.uuid(), keyspace, id.id, options_map, db_clock::now());
 
     if (erm.get_replication_strategy().get_type() == locator::replication_strategy_type::local) {
         rlogger.info("repair[{}]: completed successfully: nothing to repair for keyspace {} with local replication strategy", id.uuid(), keyspace);
@@ -1091,6 +1122,93 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
 
     if (!_gossiper.local().is_normal(utils::fb_utilities::get_broadcast_address())) {
         throw std::runtime_error("Node is not in NORMAL status yet!");
+    }
+
+    // synctable repair config
+    if (options.target_table_name != "") {
+        if (!keyspace.starts_with("alternator_")) {
+            throw std::runtime_error("synctable repair support only alternator table.");
+        }
+
+        alternator::validate_table_name(std::string(options.target_table_name.c_str()));
+
+        if (!options.incr_sync) {
+            if (options.column_families.size() != 1) {
+                throw std::runtime_error("fully synctable repair need a specified table name.");
+            }
+            if (options.column_families[0] != keyspace.substr(keyspace.find('_') + 1)) {
+                throw std::runtime_error(format("the specified table name for fully repair-sync need to be the base table while keyspace {} and specified table name {}.",
+                    keyspace, options.column_families[0]));
+            }
+        } else {
+            throw std::runtime_error("only support fully synctable repair for this version.");
+        }
+
+        service::storage_proxy::synctable_within_repair_config cfg;
+        cfg.target_table_name = options.target_table_name;
+        cfg.incr_sync = options.incr_sync;
+
+        if (options.batch_row_limit <= 0) {
+            throw std::runtime_error("batch_row_limit must be great than 0.");
+        }
+        cfg.batch_row_limit = options.batch_row_limit;
+
+        if (options.ipports.size() == 0) {
+            throw std::runtime_error("synctable repair need ips param.");
+        }
+
+        for (auto& ipport : options.ipports) {
+            std::optional<std::pair<std::string, unsigned>> ipport_opt = service::validate_and_extract_ip_port(std::string(ipport));
+            if (!ipport_opt.has_value()) {
+                throw std::runtime_error("synctable repair ips param formate error, which should be like ip:port format.");
+            }
+            cfg.destips.emplace_back(std::move(ipport_opt.value()));
+        }
+
+        if (options.projections.size() != 0) {
+            std::set<sstring> projection_set(options.projections.begin(), options.projections.end());
+            if (projection_set.size() != options.projections.size()) {
+                throw std::runtime_error("synctable repair projections param should be unique.");
+            }
+            cfg.attrs = std::move(options.projections);
+            cfg.opts.set<service::storage_proxy::synctable_option::projection>();
+
+            std::set<sstring> column_alter_set(options.column_alter.begin(), options.column_alter.end());
+            if (column_alter_set.size() != options.column_alter.size()) {
+                throw std::runtime_error("synctable repair column_alter param should be unique.");
+            }
+
+            if (!std::includes(projection_set.begin(), projection_set.end(), column_alter_set.begin(), column_alter_set.end())) {
+                throw std::runtime_error("synctable repair projections param should include all column_alter param.");
+            }
+        }
+
+        if (options.column_alter.size() != options.column_alter_method.size()) {
+            throw std::runtime_error("synctable repair column_alter param num should equal to column_alter_method param.");
+        }
+
+        std::unordered_map<sstring, service::storage_proxy::synctable_column_alter_method> method_str_to_enum_map = {
+            { "null", service::storage_proxy::synctable_column_alter_method::null },
+            { "replace_shard_id_to_zero", service::storage_proxy::synctable_column_alter_method::replace_shard_id_to_zero },
+        };
+
+        for (int i = 0; i < options.column_alter.size(); i++) {
+            sstring& alter_column_name = options.column_alter[i];
+            sstring& alter_column_method = options.column_alter_method[i];
+            if (!method_str_to_enum_map.contains(alter_column_method)) {
+                throw std::runtime_error("synctable repair column_alter_method param error. ");
+            }
+            service::storage_proxy::synctable_column_alter_method method_enum = method_str_to_enum_map.at(alter_column_method);
+            std::pair<sstring, service::storage_proxy::synctable_column_alter_method> alter_column_pair(std::move(alter_column_name), method_enum);
+            cfg.altered_columns.emplace_back(std::move(alter_column_pair));
+        }
+
+        cfg.opts.set<service::storage_proxy::synctable_option::fully>();
+
+        co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
+            return sp.insert_synctable_repair_cfg(repair_uuid, cfg);
+        });
+        rlogger.info("repair[{}]: config inserted successfully, ready to sync table during repair.", id.uuid());
     }
 
     // If the "ranges" option is not explicitly specified, we repair all the

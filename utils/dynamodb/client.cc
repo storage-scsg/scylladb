@@ -1,6 +1,7 @@
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
+#include <rapidxml.h>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/range/adaptor/map.hpp>
@@ -9,8 +10,8 @@
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/http/request.hh>
-
 #include "utils/dynamodb/client.hh"
+#include "utils/http.hh"
 #include "utils/memory_data_sink.hh"
 #include "utils/chunked_vector.hh"
 #include "utils/aws_sigv4.hh"
