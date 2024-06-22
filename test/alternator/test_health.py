@@ -20,3 +20,9 @@ def test_health_only_works_for_root_path(dynamodb):
         print(url + suffix)
         response = requests.get(url + suffix, verify=False)
         assert response.status_code in range(400, 405)
+
+# Test get localtime
+def test_localtime_works(dynamodb):
+    url = dynamodb.meta.client._endpoint.host + '/localtime'
+    response = requests.get(url, verify=True)
+    assert response.ok

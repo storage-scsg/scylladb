@@ -190,6 +190,22 @@ protected:
     }
 };
 
+class local_time_handle : public gated_handler {
+public:
+    local_time_handle(seastar::gate& pending_requests) : gated_handler(pending_requests) {}
+protected:
+    virtual future<std::unique_ptr<reply>> do_handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, false);
+        rep->set_status(reply::status_type::ok);
+        rjson::value results = rjson::empty_object();
+        rjson::add(results, "Host", rjson::from_string(req->get_header("Host")));
+        rjson::add(results, "time", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        rep->set_content_type("json");
+        rep->_content = rjson::print(std::move(results));
+        return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+    }
+};
+
 class local_nodelist_handler : public gated_handler {
     service::storage_proxy& _proxy;
     gms::gossiper& _gossiper;
@@ -440,6 +456,7 @@ void server::set_routes(routes& r) {
 
     r.put(operation_type::POST, "/", req_handler);
     r.put(operation_type::GET, "/", new health_handler(_pending_requests));
+    r.put(operation_type::GET, "/localtime", new local_time_handle(_pending_requests));
     // The "/localnodes" request is a new Alternator feature, not supported by
     // DynamoDB and not required for DynamoDB compatibility. It allows a
     // client to enquire - using a trivial HTTP request without requiring
