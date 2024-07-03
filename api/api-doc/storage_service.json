@@ -1179,6 +1179,14 @@
                      "paramType":"query"
                   },
                   {
+                     "name":"target_table_keys",
+                     "description":"The target table keys in schema",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
                      "name":"ips",
                      "description":"target cluster's accessor node's ip:port",
                      "required":false,
@@ -1211,6 +1219,22 @@
                      "paramType":"query"
                   },
                   {
+                     "name":"column_filter",
+                     "description":"which cloumn need to be filtered",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"column_filter_method",
+                     "description":"the method to filter the cooresponded column",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
                      "name":"batch_row_limit",
                      "description":"the maximum row num to be transported within a synced batch.",
                      "required":false,
@@ -1221,6 +1245,22 @@
                   {
                      "name":"incr_sync",
                      "description":"Incremental repair-synctable.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"read_before_write",
+                     "description":"read data from the endpoint first and send the missing data.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"max_connections",
+                     "description":"max_connections for each socket.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",

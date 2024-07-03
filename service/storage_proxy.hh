@@ -178,8 +178,10 @@ public:
     struct dynamodb_client_wrap {
         semaphore transport_mem;
         shared_ptr<dynamodb::client> client;
+        bool healthy;
+        lowres_clock::time_point retry_time;
     };
-    std::unordered_map<std::string, dynamodb_client_wrap> _dynamodb_clients;
+    std::unordered_map<std::string, lw_shared_ptr<dynamodb_client_wrap>> _dynamodb_clients;
 private:
 
     using response_id_type = uint64_t;
@@ -724,12 +726,18 @@ public:
     friend class hint_mutation;
     friend class cas_mutation;
 
-    shared_ptr<dynamodb::client> find_or_create_dynamodb_client(std::string endpoint); // desperated
-    shared_ptr<dynamodb::client> find_or_create_dynamodb_client(std::string ip, unsigned port);
+    lw_shared_ptr<dynamodb_client_wrap> find_or_create_dynamodb_client(std::string ip, unsigned port, unsigned max_connections = 0);
+    static bool validate_dynamodb_client(lw_shared_ptr<dynamodb_client_wrap> client_ptr);
+    static void tag_dynamodb_client_unhealthy(lw_shared_ptr<dynamodb_client_wrap> client_ptr);
 
     enum class synctable_column_alter_method {
         null, // do nothing
         replace_shard_id_to_zero,
+    };
+
+    enum class synctable_column_filter_method {
+        null, // do nothing
+        list_pattern,
     };
 
     enum class synctable_option {
@@ -744,19 +752,19 @@ public:
         synctable_option_set opts;
         sstring target_table_name;
         uint32_t batch_row_limit;
+        std::vector<sstring> target_table_keys;
         std::vector<std::pair<std::string, unsigned>> destips;
         std::vector<sstring> attrs; // used when projection-option is valid.
         std::vector<std::pair<sstring, synctable_column_alter_method>> altered_columns;
+        std::vector<std::pair<sstring, synctable_column_filter_method>> filtered_columns;
         bool incr_sync;
+        bool read_before_write;
+        unsigned max_connections_for_each_socket = 0;
 
         synctable_within_repair_config () = default;
         synctable_within_repair_config (synctable_within_repair_config& other_cfg) = default;
         synctable_within_repair_config (const synctable_within_repair_config& other_cfg) = default;
         synctable_within_repair_config (synctable_within_repair_config&& other_cfg) = default;
-        synctable_within_repair_config (synctable_option_set o, sstring ttn, int limit, std::vector<std::pair<std::string, unsigned>> ips,
-            std::vector<sstring> a, std::vector<std::pair<sstring, synctable_column_alter_method>> acs, bool incr)
-            : opts(o), target_table_name(std::move(ttn)), batch_row_limit(limit), destips(std::move(ips))
-            , attrs(std::move(a)), altered_columns(std::move(acs)), incr_sync(incr) {}
     };
 
     std::unordered_map<utils::UUID, lw_shared_ptr<synctable_within_repair_config>> _synctable_repair_config_map;

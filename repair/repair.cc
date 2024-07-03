@@ -814,12 +814,17 @@ struct repair_options {
     int ranges_parallelism = -1;
     // for synctable repair
     sstring target_table_name = "";
+    std::vector<sstring> target_table_keys;
     std::vector<sstring> ipports;
     std::vector<sstring> projections;
     std::vector<sstring> column_alter;
     std::vector<sstring> column_alter_method;
-    int batch_row_limit;
-    bool incr_sync;
+    std::vector<sstring> column_filter;
+    std::vector<sstring> column_filter_method;
+    int batch_row_limit = INT_MAX;
+    bool incr_sync = false;
+    bool read_before_write = false;
+    int max_connections = 0;
 
     repair_options(std::unordered_map<sstring, sstring> options) {
         bool_opt(primary_range, options, PRIMARY_RANGE_KEY);
@@ -830,12 +835,17 @@ struct repair_options {
         list_opt(data_centers, options, DATACENTERS_KEY);
         // for synctable repair
         string_opt(target_table_name, options, TARGET_TABLE_NAME_KEY);
+        list_opt(target_table_keys, options, TARGET_TABLE_KEY_LIST_KEY);
         list_opt(ipports, options, IP_PORT_LIST_KEY);
         list_opt(projections, options, PROJECTION_LIST_KEY);
         list_opt(column_alter, options, COLUMN_ALTER_LIST_KEY);
         list_opt(column_alter_method, options, COLUMN_ALTER_METHOD_LIST_KEY);
+        list_opt(column_filter, options, COLUMN_FILTER_LIST_KEY);
+        list_opt(column_filter_method, options, COLUMN_FILTER_METHOD_LIST_KEY);
         int_opt(batch_row_limit, options, BATCH_ROW_LIMIT_INT_KEY);
         bool_opt(incr_sync, options, INCREMENTAL_SYNCTABLE_BOOL_KEY);
+        bool_opt(read_before_write, options, READ_BEFORE_WRITE_BOOL_KEY);
+        int_opt(max_connections, options, MAX_CONNECTIONS_INT_KEY);
         // We currently do not support incremental repair. We could probably
         // ignore this option as it is just an optimization, but for now,
         // let's make it an error.
@@ -889,12 +899,17 @@ struct repair_options {
     static constexpr const char* RANGES_PARALLELISM_KEY = "ranges_parallelism";
     // for synctable repair
     static constexpr const char* TARGET_TABLE_NAME_KEY = "target_table";
+    static constexpr const char* TARGET_TABLE_KEY_LIST_KEY = "target_table_keys";
     static constexpr const char* IP_PORT_LIST_KEY = "ips";
     static constexpr const char* PROJECTION_LIST_KEY = "projection";
     static constexpr const char* COLUMN_ALTER_LIST_KEY = "column_alter";
     static constexpr const char* COLUMN_ALTER_METHOD_LIST_KEY = "column_alter_method";
+    static constexpr const char* COLUMN_FILTER_LIST_KEY = "column_filter";
+    static constexpr const char* COLUMN_FILTER_METHOD_LIST_KEY = "column_filter_method";
     static constexpr const char* BATCH_ROW_LIMIT_INT_KEY = "batch_row_limit";
     static constexpr const char* INCREMENTAL_SYNCTABLE_BOOL_KEY = "incr_sync";
+    static constexpr const char* READ_BEFORE_WRITE_BOOL_KEY = "read_before_write";
+    static constexpr const char* MAX_CONNECTIONS_INT_KEY = "max_connections";
 
     // Settings of "parallelism" option. Numbers must match Cassandra's
     // RepairParallelism enum, which is used by the caller.
@@ -1147,11 +1162,13 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
         service::storage_proxy::synctable_within_repair_config cfg;
         cfg.target_table_name = options.target_table_name;
         cfg.incr_sync = options.incr_sync;
+        cfg.read_before_write = options.read_before_write;
 
-        if (options.batch_row_limit <= 0) {
-            throw std::runtime_error("batch_row_limit must be great than 0.");
+        if (options.batch_row_limit <= 0 || options.max_connections < 0) {
+            throw std::runtime_error("batch_row_limit and max_connections must be great than 0.");
         }
         cfg.batch_row_limit = options.batch_row_limit;
+        cfg.max_connections_for_each_socket = options.max_connections;
 
         if (options.ipports.size() == 0) {
             throw std::runtime_error("synctable repair need ips param.");
@@ -1163,6 +1180,14 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
                 throw std::runtime_error("synctable repair ips param formate error, which should be like ip:port format.");
             }
             cfg.destips.emplace_back(std::move(ipport_opt.value()));
+        }
+
+        if (cfg.read_before_write == true && options.target_table_keys.size() == 0) {
+            throw std::runtime_error("target_table_keys is necessary if read_before_write is true.");
+        }
+        std::set<sstring> target_table_key_set(options.target_table_keys.begin(), options.target_table_keys.end());
+        if (target_table_key_set.size() != options.target_table_keys.size()) {
+            throw std::runtime_error("target_table_keys param should be unique.");
         }
 
         if (options.projections.size() != 0) {
@@ -1178,29 +1203,64 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
                 throw std::runtime_error("synctable repair column_alter param should be unique.");
             }
 
+            std::set<sstring> column_filter_set(options.column_filter.begin(), options.column_filter.end());
+            if (column_filter_set.size() != options.column_filter.size()) {
+                throw std::runtime_error("synctable repair column_filter param should be unique.");
+            }
+
+            if (!std::includes(projection_set.begin(), projection_set.end(), target_table_key_set.begin(), target_table_key_set.end())) {
+                throw std::runtime_error("synctable repair projections param should include all target_table_keys param.");
+            }
+    
             if (!std::includes(projection_set.begin(), projection_set.end(), column_alter_set.begin(), column_alter_set.end())) {
                 throw std::runtime_error("synctable repair projections param should include all column_alter param.");
             }
+
+            if (!std::includes(projection_set.begin(), projection_set.end(), column_filter_set.begin(), column_filter_set.end())) {
+                throw std::runtime_error("synctable repair projections param should include all column_filter param.");
+            }
         }
+
+        cfg.target_table_keys = std::move(options.target_table_keys);
 
         if (options.column_alter.size() != options.column_alter_method.size()) {
             throw std::runtime_error("synctable repair column_alter param num should equal to column_alter_method param.");
         }
 
-        std::unordered_map<sstring, service::storage_proxy::synctable_column_alter_method> method_str_to_enum_map = {
+        if (options.column_filter.size() != options.column_filter_method.size()) {
+            throw std::runtime_error("synctable repair column_filter param num should equal to column_filter_method param.");
+        }
+
+        std::unordered_map<sstring, service::storage_proxy::synctable_column_alter_method> alter_method_str_to_enum_map = {
             { "null", service::storage_proxy::synctable_column_alter_method::null },
             { "replace_shard_id_to_zero", service::storage_proxy::synctable_column_alter_method::replace_shard_id_to_zero },
+        };
+
+        std::unordered_map<sstring, service::storage_proxy::synctable_column_filter_method> filter_method_str_to_enum_map = {
+            { "null", service::storage_proxy::synctable_column_filter_method::null },
+            { "list_pattern", service::storage_proxy::synctable_column_filter_method::list_pattern },
         };
 
         for (int i = 0; i < options.column_alter.size(); i++) {
             sstring& alter_column_name = options.column_alter[i];
             sstring& alter_column_method = options.column_alter_method[i];
-            if (!method_str_to_enum_map.contains(alter_column_method)) {
+            if (!alter_method_str_to_enum_map.contains(alter_column_method)) {
                 throw std::runtime_error("synctable repair column_alter_method param error. ");
             }
-            service::storage_proxy::synctable_column_alter_method method_enum = method_str_to_enum_map.at(alter_column_method);
+            service::storage_proxy::synctable_column_alter_method method_enum = alter_method_str_to_enum_map.at(alter_column_method);
             std::pair<sstring, service::storage_proxy::synctable_column_alter_method> alter_column_pair(std::move(alter_column_name), method_enum);
             cfg.altered_columns.emplace_back(std::move(alter_column_pair));
+        }
+
+        for (int i = 0; i < options.column_filter.size(); i++) {
+            sstring& filter_column_name = options.column_filter[i];
+            sstring& filter_column_method = options.column_filter_method[i];
+            if (!filter_method_str_to_enum_map.contains(filter_column_method)) {
+                throw std::runtime_error("synctable repair column_filter_method param error. ");
+            }
+            service::storage_proxy::synctable_column_filter_method method_enum = filter_method_str_to_enum_map.at(filter_column_method);
+            std::pair<sstring, service::storage_proxy::synctable_column_filter_method> filter_column_pair(std::move(filter_column_name), method_enum);
+            cfg.filtered_columns.emplace_back(std::move(filter_column_pair));
         }
 
         cfg.opts.set<service::storage_proxy::synctable_option::fully>();

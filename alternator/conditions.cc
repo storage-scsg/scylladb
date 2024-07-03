@@ -146,7 +146,7 @@ static bool check_EQ_for_lists(const rjson::value& list1, const rjson::value& li
     }
     return true;
 }
-static bool check_EQ_for_maps(const rjson::value& list1, const rjson::value& list2) {
+bool check_EQ_for_maps(const rjson::value& list1, const rjson::value& list2) {
     if (!list1.IsObject() || !list2.IsObject() || list1.MemberCount() != list2.MemberCount()) {
         return false;
     }

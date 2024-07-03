@@ -22,9 +22,15 @@ namespace dynamodb {
 
 static logging::logger dl("dynamodb");
 
+// desperated
 future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_) {
     auto in = std::move(in_);
     co_await util::skip_entire_stream(in);
+}
+
+future<sstring> parse_reply(const http::reply& rep, input_stream<char>&& in_) {
+    auto in = std::move(in_);
+    co_return co_await util::read_entire_stream_contiguous(in);
 }
 
 client::client(std::string host, endpoint_config_ptr cfg, semaphore& mem, global_factory gf, private_tag)
@@ -106,6 +112,8 @@ client::group_client::group_client(std::unique_ptr<http::experimental::connectio
 {
 }
 
+// class_name: schedule_group_name
+// host: ip+port (ip:port)
 void client::group_client::register_metrics(std::string class_name, std::string host) {
     namespace sm = seastar::metrics;
     auto ep_label = sm::label("endpoint")(host);
@@ -140,24 +148,28 @@ client::group_client& client::find_or_create_client() {
         // Limit the maximum number of connections this group's http client
         // may have proportional to its shares. Shares are typically in the
         // range of 100...1000, thus resulting in 1..10 connections
-        auto max_connections = std::max((unsigned)(sg.get_shares() / 100), 1u);
+        auto max_connections = _cfg->max_connections;
+        if (max_connections == 0) {
+            max_connections = std::max((unsigned)(sg.get_shares() / 100), 1u);
+        }
         it = _https.emplace(std::piecewise_construct,
             std::forward_as_tuple(sg),
             std::forward_as_tuple(std::move(factory), max_connections)
         ).first;
 
-        it->second.register_metrics(sg.name(), _host);
+        std::string endpoint = seastar::format("{}:{}", _host, _cfg->port);
+        it->second.register_metrics(sg.name(), std::move(endpoint));
     }
     return it->second;
 }
 
-future<> client::make_request(http::request req, http::experimental::client::reply_handler handle, http::reply::status_type expected) {
+future<sstring> client::make_request(http::request req, http::experimental::client::reply_handler_with_string handle, http::reply::status_type expected) {
     authorize(req);
     auto& gc = find_or_create_client();
     return gc.http.make_request(std::move(req), std::move(handle), expected);
 }
 
-future<> client::make_request(http::request req, reply_handler_ext handle_ex, http::reply::status_type expected) {
+future<sstring> client::make_request(http::request req, reply_handler_ext handle_ex, http::reply::status_type expected) {
     authorize(req);
     auto& gc = find_or_create_client();
     auto handle = [&gc, handle = std::move(handle_ex)] (const http::reply& rep, input_stream<char>&& in) {
@@ -167,7 +179,7 @@ future<> client::make_request(http::request req, reply_handler_ext handle_ex, ht
     return gc.http.make_request(std::move(req), std::move(handle), expected);
 }
 
-future<> client::operate(temporary_buffer<char> buf, opcode_type op_code)
+future<sstring> client::operate(temporary_buffer<char> buf, opcode_type op_code)
 {
     auto req = http::request::make("POST", _host, "/");
     std::string headers = format("DynamoDB_20120810.{}", opcode_map[op_code]);
@@ -190,9 +202,9 @@ future<> client::operate(temporary_buffer<char> buf, opcode_type op_code)
         }
     });
 
-    co_await make_request(std::move(req), [len, start = dynamodb_clock::now()] (group_client& gc, const auto& rep, auto&& in) {
+    co_return co_await make_request(std::move(req), [len, start = dynamodb_clock::now()] (group_client& gc, const auto& rep, auto&& in) {
         gc.write_stats.update(len, dynamodb_clock::now() - start);
-        return ignore_reply(rep, std::move(in));
+        return parse_reply(rep, std::move(in));
     });
 }
 

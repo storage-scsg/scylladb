@@ -1,0 +1,86 @@
+From d4c95063db519c6ee2556a3218cff21347904c4f Mon Sep 17 00:00:00 2001
+From: yangpeiyu2 <yangpeiyu2@cmss.chinamobile.com>
+Date: Sat, 14 Sep 2024 00:33:05 +0800
+Subject: [PATCH] feat: http client update
+
+description:
+1. allow http-request returns response message from the endpoint
+2. if error occurred, we can get error_code and error_messages from the
+   exception now.
+
+Code Source From: Self Code
+
+Jira: #ESDSSGY-6622
+---
+ include/seastar/http/client.hh    |  3 +++
+ include/seastar/http/exception.hh |  3 +++
+ src/http/client.cc                | 18 ++++++++++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/include/seastar/http/client.hh b/include/seastar/http/client.hh
+index 878d30e2..1b59b8e9 100644
+--- a/include/seastar/http/client.hh
++++ b/include/seastar/http/client.hh
+@@ -184,6 +184,8 @@ class client {
+ 
+ public:
+     using reply_handler = noncopyable_function<future<>(const reply&, input_stream<char>&& body)>;
++    using reply_handler_with_string = noncopyable_function<future<sstring>(const reply&, input_stream<char>&& body)>;
++
+     /**
+      * \brief Construct a simple client
+      *
+@@ -234,6 +236,7 @@ class client {
+      *
+      */
+     future<> make_request(request req, reply_handler handle, reply::status_type expected = reply::status_type::ok);
++    future<sstring> make_request(request req, reply_handler_with_string handle, reply::status_type expected = reply::status_type::ok);
+ 
+     /**
+      * \brief Updates the maximum number of connections a client may have
+diff --git a/include/seastar/http/exception.hh b/include/seastar/http/exception.hh
+index e89645a0..a25dcb71 100644
+--- a/include/seastar/http/exception.hh
++++ b/include/seastar/http/exception.hh
+@@ -157,6 +157,9 @@ class unexpected_status_error : public base_exception {
+     unexpected_status_error(http::reply::status_type st)
+         : base_exception("Unexpected reply status", st)
+     {}
++    unexpected_status_error(const std::string& msg, http::reply::status_type st)
++        : base_exception(msg, st)
++    {}
+ };
+ 
+ SEASTAR_MODULE_EXPORT_END
+diff --git a/src/http/client.cc b/src/http/client.cc
+index 70622d0c..bf975ea7 100644
+--- a/src/http/client.cc
++++ b/src/http/client.cc
+@@ -320,6 +320,24 @@ future<> client::make_request(request req, reply_handler handle, reply::status_t
+     });
+ }
+ 
++future<sstring> client::make_request(request req, reply_handler_with_string handle, reply::status_type expected) {
++    return with_connection([req = std::move(req), handle = std::move(handle), expected] (connection& con) mutable {
++        return con.do_make_request(std::move(req)).then([&con, expected, handle = std::move(handle)] (connection::reply_ptr reply) mutable {
++            auto& rep = *reply;
++            if (rep._status != expected) {
++                return do_with(con.in(rep), [reply = std::move(reply)] (auto& in) mutable {
++                    return util::read_entire_stream_contiguous(in).then([reply = std::move(reply)] (auto message) {
++                        sstring out_message = format("error code: {} messages: {}", reply->_status, message);
++                        return make_exception_future<sstring>(httpd::unexpected_status_error(out_message, reply->_status));
++                    });
++                });
++            }
++
++            return handle(rep, con.in(rep)).finally([reply = std::move(reply)] {});
++        });
++    });
++}
++
+ future<> client::close() {
+     if (_pool.empty()) {
+         return make_ready_future<>();
+-- 
+2.43.0.windows.1
+

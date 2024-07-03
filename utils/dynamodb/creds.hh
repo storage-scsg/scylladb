@@ -20,6 +20,7 @@ struct endpoint_config {
     };
 
     std::optional<aws_config> aws;
+    unsigned max_connections = 0;
 };
 
 using endpoint_config_ptr = seastar::lw_shared_ptr<endpoint_config>;

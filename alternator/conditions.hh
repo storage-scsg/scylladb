@@ -45,4 +45,5 @@ bool verify_condition_expression(
         const parsed::condition_expression& condition_expression,
         const rjson::value* previous_item);
 
+bool check_EQ_for_maps(const rjson::value& list1, const rjson::value& list2);
 }

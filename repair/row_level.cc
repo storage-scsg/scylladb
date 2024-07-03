@@ -71,6 +71,7 @@
 #include "seastar/coroutine/exception.hh"
 #include <seastar/core/when_all.hh>
 #include "service/storage_service.hh"
+#include "alternator/conditions.hh"
 
 extern logging::logger rlogger;
 
@@ -191,12 +192,15 @@ struct row_level_repair_metrics {
     uint64_t row_from_disk_bytes{0};
     uint64_t tx_hashes_nr{0};
     uint64_t rx_hashes_nr{0};
+    // the following metrics is for synctable repair.
     struct {
         utils::UUID repair_uuid;
         lowres_clock::time_point start_time;
-        uint64_t total_row_num;
+        uint64_t total_row_nr;
+        uint64_t duplicated_row_nr;
         uint64_t total_data_size;
         uint64_t synced_row_nr_per_sec;
+        uint8_t error_indicator;
     } synced_row_nr_meta;
 
     void init_synced_row_nr_meta(utils::UUID id) {
@@ -205,20 +209,35 @@ struct row_level_repair_metrics {
         }
         synced_row_nr_meta.repair_uuid = id;
         synced_row_nr_meta.start_time = lowres_clock::now();
-        synced_row_nr_meta.total_row_num = 0;
+        synced_row_nr_meta.total_row_nr = 0;
+        synced_row_nr_meta.duplicated_row_nr = 0;
         synced_row_nr_meta.total_data_size = 0;
+        synced_row_nr_meta.error_indicator = 0;
         return;
     }
 
-    void update_synced_row_nr_meta(uint64_t row_num, uint64_t tansported_data_size) {
-        synced_row_nr_meta.total_row_num += row_num;
+    void update_synced_row_nr_meta(uint64_t row_nr, uint64_t duplicated_row_nr, uint64_t tansported_data_size) {
+        synced_row_nr_meta.total_row_nr += row_nr;
+        synced_row_nr_meta.duplicated_row_nr += duplicated_row_nr;
         synced_row_nr_meta.total_data_size += tansported_data_size;
+        return;
+    }
+
+    enum class synctable_error_code : uint8_t {
+        normal = 0,
+        read_page_error,
+        data_transport_timeout,
+        data_transport_unexception,
+    };
+
+    void error_indicate(synctable_error_code error_code) {
+        synced_row_nr_meta.error_indicator = (uint8_t)error_code;
         return;
     }
 
     void calculate_srps() {
         auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - synced_row_nr_meta.start_time).count();
-        synced_row_nr_meta.synced_row_nr_per_sec = (uint64_t)(float(synced_row_nr_meta.total_row_num) / duration);
+        synced_row_nr_meta.synced_row_nr_per_sec = (uint64_t)(float(synced_row_nr_meta.total_row_nr) / duration);
         return;
     }
 
@@ -241,12 +260,17 @@ struct row_level_repair_metrics {
                             sm::description("Total number of rows read from disk on this shard.")),
             sm::make_counter("row_from_disk_bytes", row_from_disk_bytes,
                             sm::description("Total bytes of rows read from disk on this shard.")),
-            sm::make_counter("synced_row_nr", synced_row_nr_meta.total_row_num,
+            // the following metrics is for synctable repair.
+            sm::make_gauge("synced_row_nr", synced_row_nr_meta.total_row_nr,
                             sm::description("Total number of rows synced on this shard, this value valid during repair process.")),
-            sm::make_counter("total_data_size", synced_row_nr_meta.total_data_size,
+            sm::make_gauge("duplicated_row_nr", synced_row_nr_meta.duplicated_row_nr,
+                            sm::description("duplicated row number while the read_before_write feature is on.")),
+            sm::make_gauge("total_data_size", synced_row_nr_meta.total_data_size,
                             sm::description("Total data size for synctable transported on this shard, this value valid during repair process.")),
-            sm::make_counter("srps", synced_row_nr_meta.synced_row_nr_per_sec,
+            sm::make_gauge("srps", synced_row_nr_meta.synced_row_nr_per_sec,
                             sm::description("synced num of rows per second, this value valid during repair process.")),
+            sm::make_gauge("error_indicator", synced_row_nr_meta.error_indicator,
+                            sm::description("error indicator for synctable process.")),
         });
     }
 };
@@ -2083,7 +2107,9 @@ private:
         query::partition_slice slice;
         std::optional<alternator::attrs_to_get> attrs;
         shared_ptr<cql3::selection::selection> selection;
-        shared_ptr<dynamodb::client> synctable_http_client;
+        // the bool variable means whether will we use this client in this repair round.
+        std::vector<std::pair<lw_shared_ptr<service::storage_proxy::dynamodb_client_wrap>, bool>> synctable_http_clients;
+        uint64_t start_index;
     };
 
     lw_shared_ptr<compact_for_query_state_v2> _synctable_compaction_state = nullptr;
@@ -2225,7 +2251,122 @@ private:
         co_return co_await make_ready_future<>();
     }
 
+    future<sstring> synctable_data_transport(temporary_buffer<char> transport_data, dynamodb::client::opcode_type opcode) {
+        uint32_t dest_ip_size = _synctable_common_param->synctable_http_clients.size();
+        uint32_t retry_time = 0; // try all the endpoint for timeout exception. the maximum retry time is the size of endpoint.
+        std::exception_ptr ex = nullptr;
+
+        while (retry_time < dest_ip_size) {
+            uint32_t curr_client_index = _synctable_common_param->start_index % dest_ip_size;
+            // this client has emited a timeout error for this repair round, tag it as unreachable and ignore it for the following repair round.
+            if (_synctable_common_param->synctable_http_clients[curr_client_index].second == false) {
+                _synctable_common_param->start_index++;
+                retry_time++;
+                continue;
+            }
+
+            auto dynamodb_client_wrap_ptr = _synctable_common_param->synctable_http_clients[curr_client_index].first;
+            // this client has been taged as unhealthy.
+            if (service::storage_proxy::validate_dynamodb_client(dynamodb_client_wrap_ptr) == false) {
+                _synctable_common_param->synctable_http_clients[curr_client_index].second = false;
+                _synctable_common_param->start_index++;
+                retry_time++;
+                continue;
+            }
+
+            try {
+                // operate will return normal future or a exception future(instead of throw, if throw, you will need coroutine::as_future), when get or co_await, try block will catch this exception.
+                sstring reply_message = co_await dynamodb_client_wrap_ptr->client->operate(std::move(transport_data), opcode);
+                // if request success, return immediately.
+                _synctable_common_param->start_index++;
+                co_return reply_message;
+
+            } catch (const std::system_error& error) {
+                // timeout exception
+                if (error.code().value() == 110) {
+                    // use slb so don't tag any unhealthy client to wait for 30mins.
+                    // service::storage_proxy::tag_dynamodb_client_unhealthy(dynamodb_client_wrap_ptr);
+                    _synctable_common_param->synctable_http_clients[curr_client_index].second = false;
+                    _synctable_common_param->start_index++;
+                    retry_time++;
+                    continue;
+                } else {
+                    // other exception
+                    ex = std::current_exception();
+                    break;
+                }
+            } catch (...) {
+                // other exception
+                ex = std::current_exception();
+                break;
+            }
+        }
+        if (ex) {
+            _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_unexception);
+            co_return coroutine::exception(std::move(ex));
+        }
+        // timeout, return exception
+        _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_timeout);
+        co_return coroutine::exception(std::make_exception_ptr(std::runtime_error("all client timeout")));
+    }
+
+    // in this function, we will send batchWrite Request to the other database cluster
+    // we will tag the timeout client as unhealthy and try the other client. 
+    // if all client timeout or some other error emitted, we failed and return the expection future.
+    future<> send_synctable_request(rjson::value batch_write_items, rjson::value batch_read_items, sstring& table_name) {
+        std::string temp_data;
+        auto& write_arr = batch_write_items["RequestItems"][table_name];
+        uint64_t duplicated_row_nr = 0;
+        // read data from the endpoint first, and then send the missing data.
+
+        if (_synctable_common_param->cfg->read_before_write) {
+            temp_data = rjson::print(batch_read_items);
+            temporary_buffer<char> transport_read_data(temp_data.c_str(), temp_data.length());
+            auto fut = co_await coroutine::as_future(synctable_data_transport(std::move(transport_read_data), dynamodb::client::opcode_type::batch_get_item));
+            if (fut.failed()) {
+                co_return co_await seastar::coroutine::exception(fut.get_exception());
+            }
+            auto data = fut.get();
+            rjson::value resp = rjson::parse(data);
+            auto& data_arr = resp["Responses"][table_name];
+
+            if (data_arr.Size() != 0) {
+                struct json_map_comparator {
+                    bool operator()(const rjson::value& lv, const rjson::value& rv) const {
+                        return alternator::check_EQ_for_maps(lv, rv);
+                    }
+                };
+                // template argument for template type parameter must be a type(if the comparator is a param for a func, then you can pass check_EQ_for_maps directly.)
+                // use unordered_set instead of set, because set need to pass the comparator as a param, but we cannot offer a comparator for rjson::value.
+                std::unordered_set<rjson::value, rjson::json_value_hasher, json_map_comparator> existed_data;
+
+                for (auto& item : data_arr.GetArray()) {
+                    existed_data.insert(std::move(item));
+                }
+
+                rjson::size_type i = 0;
+                while (i < write_arr.Size()) {
+                    const rjson::value& element = write_arr[i]["PutRequest"]["Item"];
+                    if (existed_data.contains(element)) {
+                        write_arr.Erase(write_arr.Begin() + i);
+                        duplicated_row_nr++;
+                    } else {
+                        ++i;
+                    }
+                }
+            }
+        }
+        if (write_arr.Size() == 0) {
+            co_return co_await make_ready_future<>();
+        }
+        temp_data = rjson::print(batch_write_items);
+        _metrics.update_synced_row_nr_meta(write_arr.Size(), duplicated_row_nr, temp_data.length());
+        temporary_buffer<char> transport_write_data(temp_data.c_str(), temp_data.length());
+        co_return co_await synctable_data_transport(std::move(transport_write_data), dynamodb::client::opcode_type::batch_write_item).discard_result();
+    }
+
 public:
+    // @return: 1 means some error occurred during synctable process and we don't want to continue the following repair process while 0 means keep going on.
     future<int> synctable_in_repair(bool use_working_row_buf) {
         // only incremental sync-repair will run this part while the fully sync will throw error when sync fail.
         if (_synctable_flag.has_value()) {
@@ -2300,8 +2441,13 @@ public:
                 auto slice = query::partition_slice(std::move(ck_bounds), {}, std::move(regular_columns), curr_opts);
                 slice.options.set<query::partition_slice::option::allow_short_read>();
 
-                auto synctable_http_client = local_sp.find_or_create_dynamodb_client(cfg->destips[0].first, cfg->destips[0].second);
-                synctable_common_param synctable_common_param_value = {cfg, std::move(slice), std::move(attrs), selection, synctable_http_client};
+                std::vector<std::pair<lw_shared_ptr<service::storage_proxy::dynamodb_client_wrap>, bool>> synctable_http_clients;
+                for (auto destip : cfg->destips) {
+                    auto synctable_http_client_ptr = local_sp.find_or_create_dynamodb_client(destip.first, destip.second, cfg->max_connections_for_each_socket);
+                    synctable_http_clients.push_back({synctable_http_client_ptr, true});
+                }
+                uint64_t start_index = get_random_seed() % synctable_http_clients.size();
+                synctable_common_param synctable_common_param_value = {cfg, std::move(slice), std::move(attrs), selection, std::move(synctable_http_clients), start_index};
                 _synctable_common_param = make_lw_shared<synctable_common_param>(std::move(synctable_common_param_value));
             }
 
@@ -2327,19 +2473,24 @@ public:
             auto f = co_await coroutine::as_future(synctable_consume_new_page(it, compacted_rows.end()));
             if (!f.failed()) {
                 query::result query_result = std::move(f).get0();
-                std::vector<rjson::value> json_items = co_await alternator::executor::transfer_query_result_to_json(_schema, _synctable_common_param->slice, _synctable_common_param->selection, query_result, _synctable_common_param->attrs);
-                uint32_t row_num = json_items.size();
+                std::vector<rjson::value> json_items = co_await alternator::executor::transfer_query_result_to_json(_schema, _synctable_common_param->slice,
+                    _synctable_common_param->selection, query_result, _synctable_common_param->attrs);
 
-                rjson::value items;
-                items = alternator::get_batch_write_item_format(std::move(json_items), _synctable_common_param->cfg->target_table_name, _synctable_common_param->cfg->altered_columns);
-                std::string temp_data = rjson::print(items);
-                _metrics.update_synced_row_nr_meta(row_num, temp_data.length());
-                temporary_buffer<char> transport_data(temp_data.c_str(), temp_data.length());
-                res.push_back(_synctable_common_param->synctable_http_client->operate(std::move(transport_data), dynamodb::client::opcode_type::batch_write_item));
+                if (json_items.size() == 0) {
+                    continue;
+                }
+
+                auto [batch_write_items, batch_read_items] = alternator::get_batch_write_read_item_format(std::move(json_items),
+                    _synctable_common_param->cfg->target_table_name, _synctable_common_param->cfg->target_table_keys,
+                    _synctable_common_param->cfg->read_before_write, _synctable_common_param->cfg->altered_columns,
+                    _synctable_common_param->cfg->filtered_columns);
+
+                res.push_back(send_synctable_request(std::move(batch_write_items), std::move(batch_read_items), _synctable_common_param->cfg->target_table_name));
             } else {
                 rlogger.error("synctable_consume_new_page failed {}", f.get_exception());
                 // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
                 _synctable_flag = false;
+                _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::read_page_error);
                 // if its incr_ysnc, just ignore the sync error.
                 if (_synctable_common_param->cfg->incr_sync) {
                     co_return co_await make_ready_future<int>(0);
@@ -2356,7 +2507,6 @@ public:
             rlogger.error("synctable_send_data failed: {}", ep);
             // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
             _synctable_flag = false;
-            return make_ready_future<>();
         });
 
         if (_synctable_common_param->cfg->incr_sync == false && _synctable_flag.value() == false) {

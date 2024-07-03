@@ -94,6 +94,7 @@ using string_ref_type = value::StringRefType;
 using string_buffer = rapidjson::GenericStringBuffer<encoding, allocator>;
 using writer = rapidjson::Writer<string_buffer, encoding, encoding, allocator>;
 using type = rapidjson::Type;
+using size_type = rapidjson::SizeType;
 
 // The default value is derived from the days when rjson resided in alternator:
 // - the original DynamoDB nested level limit is 32
@@ -297,6 +298,13 @@ void push_back(rjson::value& base_array, rjson::value&& item);
 
 // Remove a member from a JSON object. Throws if value isn't an object.
 bool remove_member(rjson::value& value, std::string_view name);
+
+struct json_value_hasher {
+    uint64_t operator()(const rjson::value& value) const;
+private:
+    uint64_t hash_str(const char* str) const;
+    uint64_t hash_value(const rjson::value& value) const;
+};
 
 struct single_value_comp {
     bool operator()(const rjson::value& r1, const rjson::value& r2) const;

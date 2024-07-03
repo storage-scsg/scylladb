@@ -299,7 +299,29 @@ bool is_big(const rjson::value& val, int big_size = 100'000);
 void validate_table_name(const std::string& name);
 
 extern const std::unordered_map<service::storage_proxy::synctable_column_alter_method, std::function<void(rjson::value&)>> alter_method_map;
+extern const std::unordered_map<service::storage_proxy::synctable_column_filter_method, std::function<bool(const rjson::value&)>> filter_method_map;
 
+// item format: { "id": {"N": "1"}, "name": {"S": "John"} }
+// git rid of non-key attributes from write_item to format read_item.
+inline rjson::value get_read_item_from_write_item(const rjson::value& write_item, const std::vector<sstring>& target_table_keys) {
+    rjson::value read_item = rjson::empty_object();
+    int key_size = target_table_keys.size();
+    int curr_size = 0;
+    for (auto it = write_item.MemberBegin(); it != write_item.MemberEnd(); ++it) {
+        std::string_view key = rjson::to_string_view(it->name);
+        if (std::find(target_table_keys.begin(), target_table_keys.end(), key) != target_table_keys.end()) {
+            rjson::value read_value = rjson::copy(it->value);
+            rjson::add_with_string_name(read_item, key, std::move(read_value));
+            curr_size++;
+            if (curr_size == key_size) {
+                break;
+            }
+        }
+    }
+    return read_item;
+}
+
+// batch write syntax
 // {                             (batch_write_obj)
 //   "RequestItems": {           (request_items_obj)
 //     "MyTable": [              (table_name_arr)
@@ -322,16 +344,54 @@ extern const std::unordered_map<service::storage_proxy::synctable_column_alter_m
 //     ]
 //   }
 // }
+
+// batch get syntax
+// {                                                  (batch_read_obj)
+//    "RequestItems": {                               (read_request_items_obj)
+//       "MyTable" : {                                (read_table_name_obj)
+//          "AttributesToGet": [ "id", "name" ],      (attrs_to_get_arr, same as target_table_keys)
+//          "ConsistentRead": false,
+//          "Keys": [                                 (read_keys_arr)
+//             {                                      (modified item， filter according to target_table_keys)
+//                "id": {"N": "1"},
+//                "name": {"S": "John"}
+//             },
+//             { 
+//                "id": {"N": "2"},
+//                "name": {"S": "Jane"}
+//             }
+//          ]
+//       }
+//    }
+// }
 template <typename Iterator>
 SEASTAR_CONCEPT( requires requires (Iterator i) {
      *i++;
      { i != i } -> std::convertible_to<bool>;
      std::same_as<std::remove_reference_t<decltype(*i)>, rapidjson::Value>;
 } )
-inline rjson::value get_batch_write_item_format(Iterator start, Iterator end, std::string_view table_name, const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns = {}) {
+// we must format read and write json togather, bacause the key used to read or write may be altered (replace_shard_id_to_zero for example) during the following code.
+inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format_impl(Iterator start, Iterator end,
+    std::string_view table_name, std::vector<sstring>& target_table_keys, bool read_before_write,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_filter_method>>& filtered_columns) {
+    // batch write json value
     rjson::value batch_write_obj = rjson::empty_object();
     rjson::value request_items_obj = rjson::empty_object();
     rjson::value table_name_arr = rjson::empty_array();
+
+    // batch read json value
+    rjson::value batch_read_obj = rjson::empty_object();
+    rjson::value read_request_items_obj = rjson::empty_object();
+    rjson::value read_table_name_obj = rjson::empty_object();
+    // rjson::value attrs_to_get_arr = rjson::empty_array();
+    rjson::value read_keys_arr = rjson::empty_array();
+
+    // we need to get all data from the peer database for comparation to decide whether to send the write request. so don't use AttributesToGet.
+    // for (auto key : target_table_keys) {
+    //     rjson::value json_key = rjson::from_string(key);
+    //     rjson::push_back(attrs_to_get_arr, std::move(json_key));
+    // }
 
     Iterator curr = start;
 
@@ -339,6 +399,26 @@ inline rjson::value get_batch_write_item_format(Iterator start, Iterator end, st
         rjson::value& item = *curr++;
         rjson::value put_request_frame_obj = rjson::empty_object();
         rjson::value put_request_obj = rjson::empty_object();
+        bool filtered = false;
+
+        for (auto& filtered_column : filtered_columns) {
+            if (filtered_column.second != service::storage_proxy::synctable_column_filter_method::null) {
+                auto column_iter = item.FindMember(filtered_column.first);
+                if (column_iter != item.MemberEnd()) {
+                    rjson::value& data = (column_iter->value).MemberBegin()->value;
+                    // if filter return ture, is means that this record donot need to be synced.
+                    if (filter_method_map.at(filtered_column.second)(data)) {
+                        filtered = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (filtered) {
+            continue;
+        }
+
         for (auto& altered_column : altered_columns) {
             if (altered_column.second != service::storage_proxy::synctable_column_alter_method::null) {
                 auto column_iter = item.FindMember(altered_column.first);
@@ -349,30 +429,51 @@ inline rjson::value get_batch_write_item_format(Iterator start, Iterator end, st
             }
         }
 
+        if (read_before_write) {
+            rjson::value read_item = get_read_item_from_write_item(item, target_table_keys);
+            rjson::push_back(read_keys_arr, std::move(read_item));
+        }
+
         rjson::add_with_string_name(put_request_obj, "Item", std::move(item));
         rjson::add_with_string_name(put_request_frame_obj, "PutRequest", std::move(put_request_obj));
         rjson::push_back(table_name_arr, std::move(put_request_frame_obj));
     }
+
+    if (read_before_write) {
+        // rjson::add_with_string_name(read_table_name_obj, "AttributesToGet", std::move(attrs_to_get_arr));
+        rjson::add_with_string_name(read_table_name_obj, "ConsistentRead", rjson::value(false));
+        rjson::add_with_string_name(read_table_name_obj, "Keys", std::move(read_keys_arr));
+        rjson::add_with_string_name(read_request_items_obj, table_name, std::move(read_table_name_obj));
+        rjson::add_with_string_name(batch_read_obj, "RequestItems", std::move(read_request_items_obj));
+    }
+
     rjson::add_with_string_name(request_items_obj, table_name, std::move(table_name_arr));
     rjson::add_with_string_name(batch_write_obj, "RequestItems", std::move(request_items_obj));
-    return batch_write_obj;
+    // need to use std::move to form tuple.
+    return {std::move(batch_write_obj), std::move(batch_read_obj)};
 }
 
 // items: [{"id": {"N": "1"}, "name": {"S": "John"}}, {"id": {"N": "2"}, "name": {"S": "Jane"}}]
-inline rjson::value get_batch_write_item_format(rjson::value items, std::string_view table_name, const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns = {}) {
+inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format(rjson::value&& items,
+    std::string_view table_name, std::vector<sstring>& target_table_keys, bool read_before_write,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_filter_method>>& filter_columns) {
     if (!items.IsArray()) {
         throw std::invalid_argument("Items has invalid format.");
     }
 
     auto curr = items.GetArray().begin();
     auto end = items.GetArray().end();
-    return get_batch_write_item_format(curr, end, table_name, altered_columns);
+    return get_batch_write_read_item_format_impl(curr, end, table_name, target_table_keys, read_before_write, altered_columns, filter_columns);
 }
 
 // items: <{"id": {"N": "1"}, "name": {"S": "John"}}, {"id": {"N": "2"}, "name": {"S": "Jane"}}>
-inline rjson::value get_batch_write_item_format(std::vector<rjson::value> items, std::string_view table_name, const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns = {}) {
+inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format(std::vector<rjson::value>&& items,
+    std::string_view table_name, std::vector<sstring>& target_table_keys, bool read_before_write,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns,
+    const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_filter_method>>& filter_columns) {
     auto curr = items.begin();
     auto end = items.end();
-    return get_batch_write_item_format(curr, end, table_name, altered_columns);
+    return get_batch_write_read_item_format_impl(curr, end, table_name, target_table_keys, read_before_write, altered_columns, filter_columns);
 }
 }

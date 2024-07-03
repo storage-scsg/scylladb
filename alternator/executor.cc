@@ -4580,7 +4580,15 @@ void replace_shard_id_to_zero_handler(rjson::value& data) {
     data.SetString(std::move(str), the_allocator);
 }
 
+bool list_pattern_filter_handler(const rjson::value& data) {
+    return false;
+}
+
 const std::unordered_map<service::storage_proxy::synctable_column_alter_method, std::function<void(rjson::value&)>> alter_method_map = {
     { service::storage_proxy::synctable_column_alter_method::replace_shard_id_to_zero, replace_shard_id_to_zero_handler },
+};
+
+const std::unordered_map<service::storage_proxy::synctable_column_filter_method, std::function<bool(const rjson::value&)>> filter_method_map = {
+    { service::storage_proxy::synctable_column_filter_method::list_pattern, list_pattern_filter_handler },
 };
 }

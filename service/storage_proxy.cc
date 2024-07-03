@@ -6572,7 +6572,7 @@ future<> storage_proxy::drain_on_shutdown() {
 future<>
 storage_proxy::stop() {
     co_await seastar::parallel_for_each(_dynamodb_clients, [] (auto& kv) {
-        return kv.second.client->close();
+        return kv.second->client->close();
     });
     co_return co_await make_ready_future<>();
 }
@@ -6585,7 +6585,7 @@ future<std::vector<dht::token_range_endpoints>> storage_proxy::describe_ring(con
     return locator::describe_ring(_db.local(), _remote->gossiper(), keyspace, include_only_local_dc);
 }
 
-static dynamodb::endpoint_config_ptr make_dynamodb_endpoint_config(unsigned long endpoint_port, bool use_https=false) {
+static dynamodb::endpoint_config_ptr make_dynamodb_endpoint_config(unsigned long endpoint_port, unsigned max_connections = 0, bool use_https=false) {
     dynamodb::endpoint_config cfg = {
         .port = endpoint_port,
         .use_https = false,
@@ -6595,40 +6595,15 @@ static dynamodb::endpoint_config_ptr make_dynamodb_endpoint_config(unsigned long
             .session_token = "IndexerSessionToken",
             .region = "us-east-1",
         }},
+        .max_connections = max_connections,
     };
     return make_lw_shared<dynamodb::endpoint_config>(std::move(cfg));
 }
 
 static constexpr int DYNAMODB_HTTP_CLIENT_MEM_SIZE = (16 << 20);
-static constexpr int ENDPOINT_SPLIT_SIZE = 2;
 
 // endpoint format: ip:port
-shared_ptr<dynamodb::client> storage_proxy::find_or_create_dynamodb_client(std::string endpoint) {
-    auto dynamodb_client_wrap_it = _dynamodb_clients.find(endpoint);
-
-    // create new http client.
-    if (dynamodb_client_wrap_it == _dynamodb_clients.end()) {
-        semaphore transport_mem(DYNAMODB_HTTP_CLIENT_MEM_SIZE);
-
-        dynamodb_client_wrap wrap_value = {std::move(transport_mem), nullptr};
-        dynamodb_client_wrap_it = _dynamodb_clients.emplace(endpoint, std::move(wrap_value)).first;
-
-        // split endpoint to ip and port.
-        std::vector<std::string> split_endpoint;
-        boost::algorithm::split(split_endpoint, std::move(endpoint), boost::is_any_of(":"));
-        if (split_endpoint.size() != ENDPOINT_SPLIT_SIZE) {
-            return shared_ptr<dynamodb::client>(nullptr);
-        }
-
-        auto dynamodb_http_client = dynamodb::client::make(std::move(split_endpoint[0]), make_dynamodb_endpoint_config(std::stoul(std::move(split_endpoint[1]))), dynamodb_client_wrap_it->second.transport_mem);
-        dynamodb_client_wrap_it->second.client = dynamodb_http_client;
-    }
-
-    return dynamodb_client_wrap_it->second.client;
-}
-
-// endpoint format: ip:port
-shared_ptr<dynamodb::client> storage_proxy::find_or_create_dynamodb_client(std::string ip, unsigned port) {
+lw_shared_ptr<storage_proxy::dynamodb_client_wrap> storage_proxy::find_or_create_dynamodb_client(std::string ip, unsigned port, unsigned max_connections) {
     std::string endpoint = seastar::format("{}:{}", ip, port);
     auto dynamodb_client_wrap_it = _dynamodb_clients.find(endpoint);
 
@@ -6636,14 +6611,38 @@ shared_ptr<dynamodb::client> storage_proxy::find_or_create_dynamodb_client(std::
     if (dynamodb_client_wrap_it == _dynamodb_clients.end()) {
         semaphore transport_mem(DYNAMODB_HTTP_CLIENT_MEM_SIZE);
 
-        dynamodb_client_wrap wrap_value = {std::move(transport_mem), nullptr};
-        dynamodb_client_wrap_it = _dynamodb_clients.emplace(endpoint, std::move(wrap_value)).first;
+        storage_proxy::dynamodb_client_wrap client_wrap_value = {std::move(transport_mem), nullptr, true, lowres_clock::now()};
+        auto dynamodb_client_wrap_ptr = make_lw_shared<storage_proxy::dynamodb_client_wrap>(std::move(client_wrap_value));
+        dynamodb_client_wrap_it = _dynamodb_clients.emplace(endpoint, dynamodb_client_wrap_ptr).first;
 
-        auto dynamodb_http_client = dynamodb::client::make(ip, make_dynamodb_endpoint_config(port), dynamodb_client_wrap_it->second.transport_mem);
-        dynamodb_client_wrap_it->second.client = dynamodb_http_client;
+        auto dynamodb_http_client = dynamodb::client::make(ip, make_dynamodb_endpoint_config(port, max_connections), dynamodb_client_wrap_it->second->transport_mem);
+        dynamodb_client_wrap_it->second->client = dynamodb_http_client;
+    }
+    return dynamodb_client_wrap_it->second;
+}
+
+static const uint32_t DYNAMODB_CLIENT_TIMEOUT_RETRY_DURATION = 1800; // 30min, 1800s
+
+bool storage_proxy::validate_dynamodb_client(lw_shared_ptr<storage_proxy::dynamodb_client_wrap> client_ptr) {
+    if (client_ptr->healthy == true) {
+        return true;
     }
 
-    return dynamodb_client_wrap_it->second.client;
+    auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - client_ptr->retry_time).count();
+    if (duration > DYNAMODB_CLIENT_TIMEOUT_RETRY_DURATION) {
+        client_ptr->healthy = true;
+        return true;
+    }
+    return false;
+}
+
+void storage_proxy::tag_dynamodb_client_unhealthy(lw_shared_ptr<storage_proxy::dynamodb_client_wrap> client_ptr) {
+    if (client_ptr->healthy == false) {
+        return;
+    }
+    client_ptr->healthy = false;
+    client_ptr->retry_time = lowres_clock::now();
+    return;
 }
 
 std::optional<std::pair<std::string, unsigned>> validate_and_extract_ip_port(const std::string& input) {

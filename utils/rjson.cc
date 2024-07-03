@@ -452,6 +452,68 @@ void push_back(rjson::value& base_array, rjson::value&& item) {
 
 }
 
+// generates a hash value for a string
+// same as djb2 hash function
+// f（hash）= hash * 33 + c
+size_t json_value_hasher::hash_str(const char* str) const {
+    size_t hash = 5381;
+    char c;
+    while ((c = *str++) != '\0')
+        hash = ((hash << 5) + hash) + (size_t)c; /* hash * 33 + c */
+    return hash;
+}
+
+size_t json_value_hasher::hash_value(const rjson::value& value) const {
+    switch (value.GetType()) {
+        case rjson::type::kNullType:
+            return 0;
+        case rjson::type::kFalseType:
+            return 1;
+        case rjson::type::kTrueType:
+            return 2;
+        case rjson::type::kObjectType: {
+            size_t hash = 0;
+            for (auto itr = value.MemberBegin(); itr != value.MemberEnd(); ++itr) {
+                // 1. rjson::value is an unordered container, and there must be no duplicate keys in a scylla record, so XOR is good enough.
+                // 2. hash_combine can only be used for ordered container.
+                hash ^= hash_str(itr->name.GetString());
+                hash ^= hash_value(itr->value);
+            }
+            return hash;
+        }
+        case rjson::type::kArrayType: {
+            size_t hash = 0;
+            for (auto& v : value.GetArray()) {
+                hash ^= hash_value(v);
+                // hash_combine(hash, hash_value(v));
+            }
+            return hash;
+        }
+        case rjson::type::kStringType:
+            return hash_str(value.GetString());
+        case rjson::type::kNumberType: {
+            if (value.IsInt()) {
+                return std::hash<int32_t>()(value.GetInt());
+            } else if (value.IsUint()) {
+                return std::hash<uint32_t>()(value.GetUint());
+            } else if (value.IsInt64()) {
+                return std::hash<int64_t>()(value.GetInt64());
+            } else if (value.IsUint64()) {
+                return std::hash<uint64_t>()(value.GetUint64());
+            } else {
+                // it's safe to call GetDouble() on any number type
+                return std::hash<double>()(value.GetDouble());
+            }
+        }
+        default:
+            return 0;
+    }
+}
+
+size_t json_value_hasher::operator()(const rjson::value& value) const {
+    return hash_value(value);
+}
+
 bool single_value_comp::operator()(const rjson::value& r1, const rjson::value& r2) const {
    auto r1_type = r1.GetType();
    auto r2_type = r2.GetType();

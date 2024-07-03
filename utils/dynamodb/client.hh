@@ -15,18 +15,21 @@ namespace dynamodb {
 using dynamodb_clock = std::chrono::steady_clock;
 
 future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_);
+future<sstring> parse_reply(const http::reply& rep, input_stream<char>&& in_);
 
 class client : public enable_shared_from_this<client> {
 public:
     enum class opcode_type {
         put_item = 0,
         batch_write_item,
+        batch_get_item,
     };
 
 private:
     std::unordered_map<opcode_type, std::string_view> opcode_map {
         {opcode_type::put_item, "PutItem"},
         {opcode_type::batch_write_item, "BatchWriteItem"},
+        {opcode_type::batch_get_item, "BatchGetItem"},
     };
 
     class upload_sink_base;
@@ -69,16 +72,16 @@ private:
 
     void authorize(http::request&);
     group_client& find_or_create_client();
-    future<> make_request(http::request req, http::experimental::client::reply_handler handle = ignore_reply, http::reply::status_type expected = http::reply::status_type::ok);
+    future<sstring> make_request(http::request req, http::experimental::client::reply_handler_with_string handle = parse_reply, http::reply::status_type expected = http::reply::status_type::ok);
 
-    using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
-    future<> make_request(http::request req, reply_handler_ext handle, http::reply::status_type expected = http::reply::status_type::ok);
+    using reply_handler_ext = noncopyable_function<future<sstring>(group_client&, const http::reply&, input_stream<char>&& body)>;
+    future<sstring> make_request(http::request req, reply_handler_ext handle, http::reply::status_type expected = http::reply::status_type::ok);
 
 public:
     explicit client(std::string host, endpoint_config_ptr cfg, semaphore& mem, global_factory gf, private_tag);
     static shared_ptr<client> make(std::string endpoint, endpoint_config_ptr cfg, semaphore& memory, global_factory gf = {});
 
-    future<> operate(temporary_buffer<char> buf, opcode_type op_code);
+    future<sstring> operate(temporary_buffer<char> buf, opcode_type op_code);
 
     void update_config(endpoint_config_ptr);
 
