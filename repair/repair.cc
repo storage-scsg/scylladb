@@ -576,7 +576,8 @@ repair::shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::modu
         const std::unordered_set<gms::inet_address>& ignore_nodes_,
         streaming::stream_reason reason_,
         bool hints_batchlog_flushed,
-        std::optional<int> ranges_parallelism)
+        std::optional<int> ranges_parallelism,
+        bool incremental)
     : repair_task_impl(module, id, 0, "shard", keyspace, "", "", parent_id_.uuid(), reason_)
     , rs(repair)
     , db(repair.get_db())
@@ -595,6 +596,7 @@ repair::shard_repair_task_impl::shard_repair_task_impl(tasks::task_manager::modu
     , total_rf(erm->get_replication_factor())
     , _hints_batchlog_flushed(std::move(hints_batchlog_flushed))
     , _user_ranges_parallelism(ranges_parallelism ? std::optional<semaphore>(semaphore(*ranges_parallelism)) : std::nullopt)
+    , _incremental(incremental)
 {
     rlogger.debug("repair[{}]: Setting user_ranges_parallelism to {}", global_repair_id.uuid(),
             _user_ranges_parallelism ? std::to_string(_user_ranges_parallelism->available_units()) : "unlimited");
@@ -690,8 +692,8 @@ future<> repair::shard_repair_task_impl::repair_range(const dht::token_range& ra
                 global_repair_id.uuid(), ranges_index, ranges_size(), _status.keyspace, table.name, range, neighbors, live_neighbors, status);
         co_return;
     }
-    rlogger.debug("repair[{}]: Repair {} out of {} ranges, keyspace={}, table={}, range={}, peers={}, live_peers={}",
-        global_repair_id.uuid(), ranges_index, ranges_size(), _status.keyspace, table.name, range, neighbors, live_neighbors);
+    rlogger.debug("repair[{}]: Repair {} out of {} ranges, keyspace={}, table={}, range={}, peers={}, live_peers={}, incremental_repair={}",
+        global_repair_id.uuid(), ranges_index, ranges_size(), _status.keyspace, table.name, range, neighbors, live_neighbors, _incremental);
     co_await mm.sync_schema(db.local(), neighbors);
     sstring cf;
     try {
@@ -851,9 +853,6 @@ struct repair_options {
         // ignore this option as it is just an optimization, but for now,
         // let's make it an error.
         bool_opt(incremental, options, INCREMENTAL_KEY);
-        if (incremental) {
-            throw std::runtime_error("unsupported incremental repair");
-        }
         // We do not currently support the distinction between "parallel" and
         // "sequential" repair, and operate the same for both.
         // We don't currently support "dc parallel" parallelism.
@@ -1035,8 +1034,8 @@ future<> repair::shard_repair_task_impl::do_repair_ranges() {
             .id = table_ids[idx],
         };
         // repair all the ranges in limited parallelism
-        rlogger.info("repair[{}]: Started to repair {} out of {} tables in keyspace={}, table={}, table_id={}, repair_reason={}",
-                global_repair_id.uuid(), idx + 1, table_ids.size(), _status.keyspace, table_info.name, table_info.id, _reason);
+        rlogger.info("repair[{}]: Started to repair {} out of {} tables in keyspace={}, table={}, table_id={}, incremental_repair={}, repair_reason={}",
+                global_repair_id.uuid(), idx + 1, table_ids.size(), _status.keyspace, table_info.name, table_info.id, _incremental, _reason);
         co_await coroutine::parallel_for_each(ranges, [this, table_info] (auto&& range) -> future<> {
             // It is possible that most of the ranges are skipped. In this case
             // this lambda will just log a message and exit. With a lot of
@@ -1172,6 +1171,10 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     auto& topology = erm.get_token_metadata().get_topology();
 
     repair_options options(options_map);
+    // 增量修复只针对 alternator 表
+    if (!std::string_view(keyspace).starts_with("alternator_") && !std::string_view(keyspace).starts_with("\"alternator_")) {
+        options.incremental = false;
+    }
 
     // Note: Cassandra can, in some cases, decide immediately that there is
     // nothing to repair, and return 0. "nodetool repair" prints in this case
@@ -1431,7 +1434,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     }
 
     auto ranges_parallelism = options.ranges_parallelism == -1 ? std::nullopt : std::optional<int>(options.ranges_parallelism);
-    auto task = co_await _repair_module->make_and_start_task<repair::user_requested_repair_task_impl>({}, id, std::move(keyspace), "", germs, std::move(cfs), std::move(ranges), std::move(options.hosts), std::move(options.data_centers), std::move(ignore_nodes), ranges_parallelism);
+    auto task = co_await _repair_module->make_and_start_task<repair::user_requested_repair_task_impl>({}, id, std::move(keyspace), "", germs, std::move(cfs), std::move(ranges), std::move(options.hosts), std::move(options.data_centers), std::move(ignore_nodes), ranges_parallelism, options.incremental);
     co_return id.id;
 }
 
@@ -1443,7 +1446,7 @@ future<> repair::user_requested_repair_task_impl::run() {
     auto id = get_repair_uniq_id();
 
     return module->run(id, [this, &rs, &db, id, keyspace = _status.keyspace, germs = std::move(_germs),
-            &cfs = _cfs, &ranges = _ranges, hosts = std::move(_hosts), data_centers = std::move(_data_centers), ignore_nodes = std::move(_ignore_nodes)] () mutable {
+            &cfs = _cfs, &ranges = _ranges, hosts = std::move(_hosts), data_centers = std::move(_data_centers), ignore_nodes = std::move(_ignore_nodes), incremental = _incremental] () mutable {
         auto uuid = node_ops_id{id.uuid().uuid()};
 
         bool needs_flush_before_repair = false;
@@ -1541,11 +1544,11 @@ future<> repair::user_requested_repair_task_impl::run() {
         auto ranges_parallelism = _ranges_parallelism;
         for (auto shard : boost::irange(unsigned(0), smp::count)) {
             auto f = rs.container().invoke_on(shard, [keyspace, table_ids, id, ranges, hints_batchlog_flushed, ranges_parallelism,
-                    data_centers, hosts, ignore_nodes, parent_data = get_repair_uniq_id().task_info, germs] (repair_service& local_repair) mutable -> future<> {
+                    data_centers, hosts, ignore_nodes, parent_data = get_repair_uniq_id().task_info, germs, incremental] (repair_service& local_repair) mutable -> future<> {
                 local_repair.get_metrics().repair_total_ranges_sum += ranges.size();
                 auto task = co_await local_repair._repair_module->make_and_start_task<repair::shard_repair_task_impl>(parent_data, tasks::task_id::create_random_id(), keyspace,
                         local_repair, germs->get().shared_from_this(), std::move(ranges), std::move(table_ids),
-                        id, std::move(data_centers), std::move(hosts), std::move(ignore_nodes), streaming::stream_reason::repair, hints_batchlog_flushed, ranges_parallelism);
+                        id, std::move(data_centers), std::move(hosts), std::move(ignore_nodes), streaming::stream_reason::repair, hints_batchlog_flushed, ranges_parallelism, incremental);
                 auto release_task_resources = defer([&] () noexcept {
                     task->release_resources();
                 });

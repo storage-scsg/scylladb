@@ -775,6 +775,7 @@ public:
     using needs_all_rows_t = bool_class<class needs_all_rows_tag>;
     using msg_addr = netw::messaging_service::msg_addr;
     using tracker_link_type = boost::intrusive::list_member_hook<bi::link_mode<boost::intrusive::auto_unlink>>;
+    static constexpr int64_t three_hours_in_us = 3LL * 3600 * 1000000;
 private:
     repair_service& _rs;
     seastar::sharded<replica::database>& _db;
@@ -838,6 +839,7 @@ private:
     gc_clock::time_point _compaction_time;
     reader_concurrency_semaphore::inactive_read_handle _fake_inactive_read_handle;
     tasks::task_id _repair_task_id;
+    bool _incremental = false;
 public:
     std::vector<repair_node_state>& all_nodes() {
         return _all_node_states;
@@ -894,7 +896,8 @@ public:
             size_t nr_peer_nodes,
             row_level_repair* row_level_repair_ptr,
             gc_clock::time_point compaction_time,
-            tasks::task_id repair_task_id = {})
+            tasks::task_id repair_task_id = {},
+            bool incremental = false)
             : _rs(rs)
             , _db(rs.get_db())
             , _messaging(rs.get_messaging())
@@ -933,6 +936,7 @@ public:
             , _repair_hasher(_seed, _schema)
             , _compaction_time(compaction_time)
             , _repair_task_id(repair_task_id)
+            , _incremental(incremental)
             {
             if (master) {
                 add_to_repair_meta_for_masters(*this);
@@ -967,9 +971,10 @@ public:
             streaming::stream_reason reason,
             shard_config master_node_shard_config,
             inet_address_vector_replica_set all_live_peer_nodes,
-            gc_clock::time_point compaction_time)
+            gc_clock::time_point compaction_time,
+            bool incremental = false)
         : repair_meta(rs, cf, std::move(s), std::move(permit), std::move(range), algo, max_row_buf_size, seed, master, repair_meta_id, reason,
-                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, nullptr, compaction_time)
+                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, nullptr, compaction_time, {}, incremental)
     {
     }
 
@@ -1012,6 +1017,10 @@ public:
             }
         }
 
+    }
+
+    bool incremental() {
+        return _incremental;
     }
 
     repair_hash_set& peer_row_hash_sets(unsigned node_idx) {
@@ -1171,6 +1180,81 @@ private:
         cur_rows.push_back(std::move(r));
     }
 
+    void incremental_handle_mutation_fragment(mutation_fragment& mf, size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
+        // 找到 repair_history 对应内存中该表的信息
+        auto& table_id = _schema->id();
+        auto& gc_state = _db.local().get_compaction_manager().get_tombstone_gc_state();
+        auto m = gc_state.get_or_create_repair_history_map_for_table(table_id);
+
+        if (mf.is_partition_start()) {
+            auto& start = mf.as_partition_start();
+            _repair_reader->set_current_dk(start.key());
+            if (!start.partition_tombstone()) {
+                // Ignore partition_start with empty partition tombstone
+                return;
+            }
+            // 该分区存在墓碑的情况（一般在只有 pk，没有 sk 的情况下删除会出现）
+            if (m) {
+                // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
+                // 将分区中墓碑的时间与 repair_time - 3h 比较
+                const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
+                if (it != m->map.end() && start.partition_tombstone().get_deletion_time() <= it->second - std::chrono::hours(3)) {
+                    return;
+                }
+            }
+        } else if (mf.is_end_of_partition()) {
+            _repair_reader->clear_current_dk();
+            return;
+        } else if (mf.is_clustering_row() && m) {
+            // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
+            const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
+            if (it != m->map.end()) {
+                // 预留 3 小时避免丢失数据
+                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - three_hours_in_us;
+                auto& clustering_row = mf.as_clustering_row();
+                auto& row_marker = clustering_row.marker();
+                // 获取 LivenessInfo 里的时间戳（如果不存在则为一个负值）
+                auto row_marker_timestamp = row_marker.timestamp();
+                auto row_tombstone = clustering_row.tomb();
+                // 获取 DeletionInfo 里较大的时间戳（如果不存在则为一个负值）
+                auto row_tombstone_timestamp = row_tombstone.max_timestamp();
+                // 如果两个时间戳都小于修复时间，那么跳过这条数据
+                if (row_marker_timestamp <= repaired_time && row_tombstone_timestamp <= repaired_time) {
+                    return;
+                }
+            }
+        } else if (mf.is_static_row() && m) {
+            // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
+            const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
+            if (it != m->map.end()) {
+                // 预留 3 小时避免丢失数据
+                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - three_hours_in_us;
+                auto& row = mf.as_static_row().cells();
+                bool repaired = true;
+                // 多个 static_row 的情况下会被放到同一个 row 里，只要有一列 static_row 没有被修复过，则整个 static_row 都需要被修复
+                row.for_each_cell([this, &repaired, repaired_time] (column_id id, const atomic_cell_or_collection& c) {
+                    auto&& column_definition = _schema->column_at(column_kind::static_column, id);
+                    if (c.as_atomic_cell(column_definition).timestamp() > repaired_time) {
+                        repaired = false;
+                    }
+                });
+                if (repaired) {
+                    return;
+                }
+            }
+        }
+
+        auto hash = _repair_hasher.do_hash_for_mf(*_repair_reader->get_current_dk(), mf);
+        repair_row r(freeze(*_schema, mf), position_in_partition(mf.position()), _repair_reader->get_current_dk(), hash, is_dirty_on_master::no);
+        rlogger.trace("Reading: r.boundary={}, r.hash={}", r.boundary(), r.hash());
+        auto sz = r.size();
+        _metrics.row_from_disk_nr++;
+        _metrics.row_from_disk_bytes += sz;
+        cur_size += sz;
+        new_rows_size += sz;
+        cur_rows.push_back(std::move(r));
+    }
+
     // Read rows from sstable until the size of rows exceeds _max_row_buf_size  - current_size
     // This reads rows from where the reader left last time into _row_buf
     // _current_sync_boundary or _last_sync_boundary have no effect on the reader neither.
@@ -1249,7 +1333,11 @@ private:
                     co_await _repair_reader->on_end_of_stream();
                     break;
                 }
-                handle_mutation_fragment(*mfopt, cur_size, new_rows_size, cur_rows);
+                if (_incremental) {
+                    incremental_handle_mutation_fragment(*mfopt, cur_size, new_rows_size, cur_rows);
+                } else {
+                    handle_mutation_fragment(*mfopt, cur_size, new_rows_size, cur_rows);
+                }
             }
         } catch (...) {
             ex = std::current_exception();
@@ -1625,7 +1713,7 @@ public:
 
     // RPC API
     future<>
-    repair_row_level_start(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, table_schema_version schema_version, streaming::stream_reason reason, gc_clock::time_point compaction_time) {
+    repair_row_level_start(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, table_schema_version schema_version, streaming::stream_reason reason, gc_clock::time_point compaction_time, bool incremental) {
         if (remote_node == _myip) {
             return make_ready_future<>();
         }
@@ -1639,7 +1727,7 @@ public:
         return _messaging.send_repair_row_level_start(msg_addr(remote_node),
                 _repair_meta_id, ks_name, cf_name, std::move(range), _algo, _max_row_buf_size, _seed,
                 _master_node_shard_config.shard, _master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb,
-                remote_partitioner_name, std::move(schema_version), reason, compaction_time).then([ks_name, cf_name] (rpc::optional<repair_row_level_start_response> resp) {
+                remote_partitioner_name, std::move(schema_version), reason, compaction_time, incremental).then([ks_name, cf_name] (rpc::optional<repair_row_level_start_response> resp) {
             if (resp && resp->status == repair_row_level_start_status::no_such_column_family) {
                 return make_exception_future<>(replica::no_such_column_family(ks_name, cf_name));
             } else {
@@ -1653,10 +1741,10 @@ public:
     repair_row_level_start_handler(repair_service& repair, gms::inet_address from, uint32_t src_cpu_id, uint32_t repair_meta_id, sstring ks_name, sstring cf_name,
             dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size,
             uint64_t seed, shard_config master_node_shard_config, table_schema_version schema_version, streaming::stream_reason reason,
-            gc_clock::time_point compaction_time, abort_source& as) {
+            gc_clock::time_point compaction_time, abort_source& as, bool incremental) {
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
             utils::fb_utilities::get_broadcast_address(), from, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
-        return repair.insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as).then([] {
+        return repair.insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, incremental).then([] {
             return repair_row_level_start_response{repair_row_level_start_status::ok};
         }).handle_exception_type([] (replica::no_such_column_family&) {
             return repair_row_level_start_response{repair_row_level_start_status::no_such_column_family};
@@ -3022,11 +3110,11 @@ future<> repair_service::init_ms_handlers() {
     ms.register_repair_row_level_start([this] (const rpc::client_info& cinfo, uint32_t repair_meta_id, sstring ks_name,
             sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed,
             unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version,
-            rpc::optional<streaming::stream_reason> reason, rpc::optional<gc_clock::time_point> compaction_time) {
+            rpc::optional<streaming::stream_reason> reason, rpc::optional<gc_clock::time_point> compaction_time, bool incremental) {
         auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
         auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
         return container().invoke_on(src_cpu_id % smp::count, [from, src_cpu_id, repair_meta_id, ks_name, cf_name,
-                range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this] (repair_service& local_repair) mutable {
+                range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this, incremental] (repair_service& local_repair) mutable {
             if (!local_repair._sys_dist_ks.local_is_initialized() || !local_repair._view_update_generator.local_is_initialized()) {
                 return make_exception_future<repair_row_level_start_response>(std::runtime_error(format("Node {} is not fully initialized for repair, try again later",
                         utils::fb_utilities::get_broadcast_address())));
@@ -3036,7 +3124,7 @@ future<> repair_service::init_ms_handlers() {
             return repair_meta::repair_row_level_start_handler(local_repair, from, src_cpu_id, repair_meta_id, std::move(ks_name),
                     std::move(cf_name), std::move(range), algo, max_row_buf_size, seed,
                     shard_config{remote_shard, remote_shard_count, remote_ignore_msb},
-                    schema_version, r, ct, _repair_module->abort_source());
+                    schema_version, r, ct, _repair_module->abort_source(), incremental);
         });
     });
     ms.register_repair_row_level_stop([this] (const rpc::client_info& cinfo, uint32_t repair_meta_id,
@@ -3212,8 +3300,8 @@ private:
         _sync_boundaries.clear();
         _combined_hashes.clear();
         _zero_rows = false;
-        rlogger.debug("ROUND {}, _last_sync_boundary={}, _current_sync_boundary={}, _skipped_sync_boundary={}",
-                master.stats().round_nr, master.last_sync_boundary(), master.current_sync_boundary(), _skipped_sync_boundary);
+        rlogger.debug("ROUND {}, _last_sync_boundary={}, _current_sync_boundary={}, _skipped_sync_boundary={}, _incremental={}",
+                master.stats().round_nr, master.last_sync_boundary(), master.current_sync_boundary(), _skipped_sync_boundary, master.incremental());
         master.stats().round_nr++;
         parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
             const auto& node = ns.node;
@@ -3483,7 +3571,7 @@ private:
             co_return;
         }
         // Update repair_history table only if both hints and batchlog have been flushed.
-        if (!_shard_task.hints_batchlog_flushed()) {
+        if (!_shard_task.hints_batchlog_flushed() && !_shard_task.incremental()) {
             co_return;
         }
         repair_service& rs = _shard_task.rs;
@@ -3554,15 +3642,16 @@ public:
                     _all_live_peer_nodes.size(),
                     this,
                     compaction_time,
-                    _shard_task.global_repair_id.uuid());
+                    _shard_task.global_repair_id.uuid(),
+                    _shard_task.incremental());
             auto auto_stop_master = defer([&master] {
                 master.stop().handle_exception([] (std::exception_ptr ep) {
                     rlogger.warn("Failed auto-stopping Row Level Repair (Master): {}. Ignored.", ep);
                 }).get();
             });
 
-            rlogger.debug(">>> Started Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_size={}",
-                    master.myip(), _all_live_peer_nodes, master.repair_meta_id(), _shard_task.get_keyspace(), _cf_name, schema_version, _range, _seed, max_row_buf_size);
+            rlogger.debug(">>> Started Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_size={}, incremental_repair={}",
+                    master.myip(), _all_live_peer_nodes, master.repair_meta_id(), _shard_task.get_keyspace(), _cf_name, schema_version, _range, _seed, max_row_buf_size, _shard_task.incremental());
 
 
             std::vector<gms::inet_address> nodes_to_stop;
@@ -3571,7 +3660,7 @@ public:
                 parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
                     const auto& node = ns.node;
                     ns.state = repair_state::row_level_start_started;
-                    return master.repair_row_level_start(node, _shard_task.get_keyspace(), _cf_name, _range, schema_version, _shard_task.reason(), compaction_time).then([&] () {
+                    return master.repair_row_level_start(node, _shard_task.get_keyspace(), _cf_name, _range, schema_version, _shard_task.reason(), compaction_time, _shard_task.incremental()).then([&] () {
                         ns.state = repair_state::row_level_start_finished;
                         nodes_to_stop.push_back(node);
                         ns.state = repair_state::get_estimated_partitions_started;
@@ -3869,7 +3958,8 @@ repair_service::insert_repair_meta(
         table_schema_version schema_version,
         streaming::stream_reason reason,
         gc_clock::time_point compaction_time,
-        abort_source& as) {
+        abort_source& as,
+        bool incremental) {
     return get_migration_manager().get_schema_for_write(schema_version, {from, src_cpu_id}, get_messaging(), &as).then([this,
             from,
             repair_meta_id,
@@ -3879,7 +3969,8 @@ repair_service::insert_repair_meta(
             seed,
             master_node_shard_config,
             reason,
-            compaction_time] (schema_ptr s) {
+            compaction_time,
+            incremental] (schema_ptr s) {
         auto& db = get_db();
         return db.local().obtain_reader_permit(db.local().find_column_family(s->id()), "repair-meta", db::no_timeout, {}).then([s = std::move(s),
                 this,
@@ -3891,7 +3982,8 @@ repair_service::insert_repair_meta(
                 seed,
                 master_node_shard_config,
                 reason,
-                compaction_time] (reader_permit permit) mutable {
+                compaction_time,
+                incremental] (reader_permit permit) mutable {
         node_repair_meta_id id{from, repair_meta_id};
         auto rm = seastar::make_shared<repair_meta>(*this,
                 get_db().local().find_column_family(s->id()),
@@ -3906,7 +3998,8 @@ repair_service::insert_repair_meta(
                 reason,
                 std::move(master_node_shard_config),
                 inet_address_vector_replica_set{from},
-                compaction_time);
+                compaction_time,
+                incremental);
         rm->set_repair_state_for_local_node(repair_state::row_level_start_started);
         bool insertion = repair_meta_map().emplace(id, rm).second;
         if (!insertion) {

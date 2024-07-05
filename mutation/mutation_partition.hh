@@ -769,6 +769,10 @@ public:
         return std::max(_regular.deletion_time, _shadowable.tomb().deletion_time);
     }
 
+    const api::timestamp_type max_timestamp() const {
+        return std::max(_regular.timestamp, _shadowable.tomb().timestamp);
+    }
+
     const tombstone& regular() const {
         return _regular;
     }

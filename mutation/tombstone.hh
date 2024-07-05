@@ -61,6 +61,11 @@ struct tombstone final {
         result.apply(t);
         return result;
     }
+
+    gc_clock::time_point get_deletion_time() const {
+        return deletion_time;
+    }
+    
 };
 
 template <>

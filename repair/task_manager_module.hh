@@ -47,8 +47,9 @@ private:
     std::vector<sstring> _data_centers;
     std::unordered_set<gms::inet_address> _ignore_nodes;
     std::optional<int> _ranges_parallelism;
+    bool _incremental = false;
 public:
-    user_requested_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, std::string keyspace, std::string entity, lw_shared_ptr<locator::global_vnode_effective_replication_map> germs, std::vector<sstring> cfs, dht::token_range_vector ranges, std::vector<sstring> hosts, std::vector<sstring> data_centers, std::unordered_set<gms::inet_address> ignore_nodes, std::optional<int> ranges_parallelism) noexcept
+    user_requested_repair_task_impl(tasks::task_manager::module_ptr module, repair_uniq_id id, std::string keyspace, std::string entity, lw_shared_ptr<locator::global_vnode_effective_replication_map> germs, std::vector<sstring> cfs, dht::token_range_vector ranges, std::vector<sstring> hosts, std::vector<sstring> data_centers, std::unordered_set<gms::inet_address> ignore_nodes, std::optional<int> ranges_parallelism, bool incremental) noexcept
         : repair_task_impl(module, id.uuid(), id.id, "keyspace", std::move(keyspace), "", std::move(entity), tasks::task_id::create_null_id(), streaming::stream_reason::repair)
         , _germs(germs)
         , _cfs(std::move(cfs))
@@ -57,6 +58,7 @@ public:
         , _data_centers(std::move(data_centers))
         , _ignore_nodes(std::move(ignore_nodes))
         , _ranges_parallelism(ranges_parallelism)
+        , _incremental(incremental)
     {}
 
     virtual tasks::is_abortable is_abortable() const noexcept override {
@@ -128,6 +130,7 @@ private:
     std::optional<sstring> _failed_because;
     std::optional<semaphore> _user_ranges_parallelism;
     uint64_t _ranges_complete = 0;
+    bool _incremental = false;
 public:
     shard_repair_task_impl(tasks::task_manager::module_ptr module,
             tasks::task_id id,
@@ -142,7 +145,8 @@ public:
             const std::unordered_set<gms::inet_address>& ignore_nodes_,
             streaming::stream_reason reason_,
             bool hints_batchlog_flushed,
-            std::optional<int> ranges_parallelism);
+            std::optional<int> ranges_parallelism,
+            bool incremental = false);
     void check_failed_ranges();
     void check_in_abort_or_shutdown();
     repair_neighbors get_repair_neighbors(const dht::token_range& range);
@@ -164,6 +168,10 @@ public:
     }
 
     future<> repair_range(const dht::token_range& range, table_info table);
+
+    bool incremental() const {
+        return _incremental;
+    }
 
     size_t ranges_size() const noexcept;
 
