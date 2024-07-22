@@ -1224,6 +1224,8 @@ void table::rebuild_statistics() {
     _stats.live_disk_space_used = 0;
     _stats.live_sstable_count = 0;
     _stats.total_disk_space_used = 0;
+    _stats.estimated_row_count = 0;
+    _stats.estimated_tombstone_count = 0;
 
     _sstables->for_each_sstable([this] (const sstables::shared_sstable& tab) {
         update_stats_for_new_sstable(tab->bytes_on_disk(), tab->get_stats_metadata().rows_count, tab->get_stats_metadata().estimated_tombstone_drop_time.sum());
