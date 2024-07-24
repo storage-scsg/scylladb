@@ -9,6 +9,10 @@
 # require the same fixture, it can be set up only once - while still allowing
 # the user to run individual tests and automatically set up the fixtures they need.
 
+# Use the run.py library from ../cql-pytest:
+import sys
+sys.path.insert(1, sys.path[0] + '/../cql-pytest')
+import run
 import pytest
 import boto3
 import requests
@@ -305,3 +309,12 @@ def optional_rest_api(dynamodb):
     except:
         return None
     return url
+
+# Adjust gc_grace_seconds value of a table
+def adjust_gc_grace_seconds_of_table(dynamodb, table, seconds):
+    parsed_url = urlparse(dynamodb.meta.client._endpoint.host)
+    ip = parsed_url.netloc.split(':')[0]
+    cluster = run.get_cql_cluster(ip)
+    cql = str('ALTER TABLE "alternator_' + table.name + '"."' + table.name + '" WITH gc_grace_seconds=' + str(seconds) + ';')
+    cluster.connect().execute(cql)
+    cluster.shutdown()

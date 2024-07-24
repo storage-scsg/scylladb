@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from botocore.exceptions import ClientError
 
 from util import random_string, new_test_table, is_aws
+from conftest import filled_test_table, adjust_gc_grace_seconds_of_table
 
 # Fixture for checking if we are able to test Scylla metrics. Scylla metrics
 # are not available on AWS (of course), but may also not be available for
@@ -290,3 +291,43 @@ def test_ttl_stats(dynamodb, metrics, alternator_ttl_period_in_seconds):
 # ({put,get,delete,update}_item_latency, get_records_latency),
 # reads_before_write, write_using_lwt, shard_bounce_for_lwt,
 # requests_blocked_memory, requests_shed
+            
+###### Test metrics of estimated_row_count and estimated_tombstone_count.
+#
+# The method to obtain estimated_row_count and estimated_tombstone_count.
+# Before obtaining the indicator, flush and compact need to be executed to
+# avoid sstable write amplification problem.
+def get_row_and_tombstone_metrics(metrics, rest_api, table):
+    requests.post(rest_api+'/storage_service/keyspace_flush/alternator_'+table.name, params={'cf' : table.name})
+    requests.post(rest_api+'/storage_service/keyspace_compaction/alternator_'+table.name, params={'cf' : table.name})
+    the_metrics = get_metrics(metrics)
+    row_count = { table.name: get_metric(metrics, 'scylla_column_family_estimated_row_count', {'cf': table.name}, the_metrics) }
+    tombstone_count = { table.name: get_metric(metrics, 'scylla_column_family_estimated_tombstone_count', {'cf': table.name}, the_metrics) }
+    return row_count, tombstone_count
+
+# The row count here does not represent real live rows. A tombstone will
+# also be counted as a row.
+def test_estimated_rows_and_tombstones(dynamodb, metrics, rest_api):
+    with new_test_table(dynamodb,
+            KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
+            AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'S' } ]) as table:
+
+        origin_metrics_row_count,origin_metrics_tombstone_count = get_row_and_tombstone_metrics(metrics, rest_api, table)
+        assert origin_metrics_row_count[table.name] == 0
+        assert origin_metrics_tombstone_count[table.name] == 0
+
+        # When writing through alternator, 'deletion_info' will be marked and
+        # counted as a tombstone. We wait for the tombstone to expire before
+        # obtaining the real indicator metrics.
+        adjust_gc_grace_seconds_of_table(dynamodb, table, 0)
+        table.put_item(Item={'p': 'p1', 'c':'c1','rows':'should be 1', 'tombstones':'should be 0'})
+        time.sleep(1)
+        add_one_metrics_row_count, add_one_metrics_tombstone_count = get_row_and_tombstone_metrics(metrics, rest_api, table)
+        assert add_one_metrics_row_count[table.name] == 1
+        assert add_one_metrics_tombstone_count[table.name] == 0
+
+        adjust_gc_grace_seconds_of_table(dynamodb, table, 864000)
+        table.delete_item(Key={'p': 'p1', 'c':'c1'})
+        subtract_one_metrics_row_count, subtract_one_metrics_tombstone_count = get_row_and_tombstone_metrics(metrics, rest_api, table)
+        assert subtract_one_metrics_row_count[table.name] == 1
+        assert subtract_one_metrics_tombstone_count[table.name] == 1

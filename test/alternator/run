@@ -59,6 +59,7 @@ def run_alternator_cmd(pid, dir):
     else:
         cmd += ['--alternator-port', '8000']
     cmd += extra_scylla_options
+    cmd += ['--enable-keyspace-column-family-estimated-row-count', 'true']
 
     return (cmd, env)
 
