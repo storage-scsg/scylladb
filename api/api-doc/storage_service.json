@@ -1188,7 +1188,7 @@
                   },
                   {
                      "name":"ips",
-                     "description":"target cluster's accessor node's ip:port",
+                     "description":"Target cluster's accessor node's ip:port",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1196,7 +1196,7 @@
                   },
                   {
                      "name":"projection",
-                     "description":"select which columns to return",
+                     "description":"Select which columns to return",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1204,7 +1204,7 @@
                   },
                   {
                      "name":"column_alter",
-                     "description":"which cloumn need to be altered",
+                     "description":"Which cloumn need to be altered",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1212,7 +1212,7 @@
                   },
                   {
                      "name":"column_alter_method",
-                     "description":"the method to alter the cooresponded column",
+                     "description":"The method to alter the cooresponded column",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1220,7 +1220,7 @@
                   },
                   {
                      "name":"column_filter",
-                     "description":"which cloumn need to be filtered",
+                     "description":"Which cloumn need to be filtered",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1228,7 +1228,7 @@
                   },
                   {
                      "name":"column_filter_method",
-                     "description":"the method to filter the cooresponded column",
+                     "description":"The method to filter the cooresponded column",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1236,15 +1236,7 @@
                   },
                   {
                      "name":"batch_row_limit",
-                     "description":"the maximum row num to be transported within a synced batch.",
-                     "required":false,
-                     "allowMultiple":false,
-                     "type":"string",
-                     "paramType":"query"
-                  },
-                  {
-                     "name":"incr_sync",
-                     "description":"Incremental repair-synctable.",
+                     "description":"The maximum row num to be transported within a synced batch.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1252,7 +1244,7 @@
                   },
                   {
                      "name":"read_before_write",
-                     "description":"read data from the endpoint first and send the missing data.",
+                     "description":"Read data from the endpoint first and send the missing data.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -1260,7 +1252,15 @@
                   },
                   {
                      "name":"max_connections",
-                     "description":"max_connections for each socket.",
+                     "description":"Maximum connections for each socket.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"peer_ops",
+                     "description":"Maximum ops for peer database, this param is used to limit the output ops from e2 to e3.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",

@@ -178,8 +178,6 @@ public:
     struct dynamodb_client_wrap {
         semaphore transport_mem;
         shared_ptr<dynamodb::client> client;
-        bool healthy;
-        lowres_clock::time_point retry_time;
     };
     std::unordered_map<std::string, lw_shared_ptr<dynamodb_client_wrap>> _dynamodb_clients;
 private:
@@ -726,65 +724,81 @@ public:
     friend class hint_mutation;
     friend class cas_mutation;
 
-    lw_shared_ptr<dynamodb_client_wrap> find_or_create_dynamodb_client(std::string ip, unsigned port, unsigned max_connections = 0);
-    static bool validate_dynamodb_client(lw_shared_ptr<dynamodb_client_wrap> client_ptr);
-    static void tag_dynamodb_client_unhealthy(lw_shared_ptr<dynamodb_client_wrap> client_ptr);
+    lw_shared_ptr<dynamodb_client_wrap> find_or_create_dynamodb_client(const std::string& ip, uint32_t port, uint32_t max_conns = 0);
 
     enum class synctable_column_alter_method {
-        null, // do nothing
-        replace_shard_id_to_zero,
+        replace_shard_id_to_zero, // replace the shard id to 0, because cdc-list do not need it anymore.
     };
 
     enum class synctable_column_filter_method {
-        null, // do nothing
-        list_pattern,
+        list_pattern, // filter row which matches list_pattern.
     };
 
     enum class synctable_option {
-        fully,
-        projection,
+        fully, // sync all columns to the target table.
+        projection, // sync the projected columns to the target table.
     };
     using synctable_option_set = enum_set<super_enum<synctable_option,
         synctable_option::fully,
         synctable_option::projection>>;
 
-    struct synctable_within_repair_config {
+    struct synctable_repair_config {
         synctable_option_set opts;
         sstring target_table_name;
         uint32_t batch_row_limit;
         std::vector<sstring> target_table_keys;
-        std::vector<std::pair<std::string, unsigned>> destips;
+        std::vector<std::pair<std::string, uint32_t>> dest_ip_port_arr;
         std::vector<sstring> attrs; // used when projection-option is valid.
         std::vector<std::pair<sstring, synctable_column_alter_method>> altered_columns;
         std::vector<std::pair<sstring, synctable_column_filter_method>> filtered_columns;
-        bool incr_sync;
         bool read_before_write;
-        unsigned max_connections_for_each_socket = 0;
-
-        synctable_within_repair_config () = default;
-        synctable_within_repair_config (synctable_within_repair_config& other_cfg) = default;
-        synctable_within_repair_config (const synctable_within_repair_config& other_cfg) = default;
-        synctable_within_repair_config (synctable_within_repair_config&& other_cfg) = default;
+        uint32_t max_conns_per_client = 0;
+        uint32_t http_conn_resource;
+        uint32_t expected_transport_latency; // the expected batch_put_item operation latency. if the real latency is smaller than it, we have to sleep to control the ops.
+        bool error_occurred = false; // if some error occurred during repair process, set this flag and no more repair process will continue.
     };
 
-    std::unordered_map<utils::UUID, lw_shared_ptr<synctable_within_repair_config>> _synctable_repair_config_map;
+    struct synctable_repair_config_pershard {
+        synctable_repair_config cfg;
+        seastar::semaphore http_conn_limit;
+        std::vector<std::pair<lw_shared_ptr<dynamodb_client_wrap>, bool>> synctable_http_clients;
+    };
 
-    inline future<> insert_synctable_repair_cfg(const tasks::task_id& id, const synctable_within_repair_config& cfg) {
-        _synctable_repair_config_map[id.uuid()] = make_lw_shared<synctable_within_repair_config>(cfg);
+    std::unordered_map<utils::UUID, lw_shared_ptr<synctable_repair_config_pershard>> _synctable_repair_config_map;
+
+    inline future<> insert_synctable_repair_cfg(const tasks::task_id& id, synctable_repair_config cfg) {
+        // 1. create semphore to control the total concurrency of http transport for this synctable-repair process.
+        seastar::semaphore http_conn_limit = seastar::semaphore(cfg.http_conn_resource);
+
+        // 2. create http-clients. bool value means the healthy status for this synctable-repair round.
+        std::vector<std::pair<lw_shared_ptr<dynamodb_client_wrap>, bool>> http_clients;
+        for (const auto& dest_ip_port : cfg.dest_ip_port_arr) {
+            auto synctable_http_client_ptr = find_or_create_dynamodb_client(dest_ip_port.first, dest_ip_port.second, cfg.max_conns_per_client);
+            http_clients.push_back({synctable_http_client_ptr, true});
+        }
+        synctable_repair_config_pershard shard_cfg = {std::move(cfg), std::move(http_conn_limit), std::move(http_clients)};
+        _synctable_repair_config_map[id.uuid()] = make_lw_shared<synctable_repair_config_pershard>(std::move(shard_cfg));
         return make_ready_future<>();
     }
 
-    inline const lw_shared_ptr<synctable_within_repair_config> get_synctable_repair_cfg(tasks::task_id& id) {
+    inline lw_shared_ptr<synctable_repair_config_pershard> get_synctable_repair_cfg(const tasks::task_id& id) {
         auto it = _synctable_repair_config_map.find(id.uuid());
         if (it != _synctable_repair_config_map.end()) {
             return it->second;
-        } else {
-            return nullptr;
         }
+        return nullptr;
     }
 
     inline void delete_synctable_repair_cfg(const tasks::task_id& id) {
         _synctable_repair_config_map.erase(id.uuid());
+    }
+
+    inline void tag_synctable_repair_error(const tasks::task_id& id) {
+        auto it = _synctable_repair_config_map.find(id.uuid());
+        if (it != _synctable_repair_config_map.end()) {
+            it->second->cfg.error_occurred = true;
+        }
+        return;
     }
 };
 

@@ -330,8 +330,8 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
         static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
                 "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "ignore_nodes", "trace",
                 "startToken", "endToken", "ranges_parallelism", "target_table", "target_table_keys", "ips",
-                "projection", "column_alter", "column_alter_method", "batch_row_limit", "incr_sync",
-                "read_before_write", "column_filter", "column_filter_method", "max_connections"};
+                "projection", "column_alter", "column_alter_method", "batch_row_limit", "read_before_write",
+                "column_filter", "column_filter_method", "max_connections", "peer_ops"};
         std::unordered_map<sstring, sstring> options_map;
         for (auto o : options) {
             auto s = req->get_query_param(o);

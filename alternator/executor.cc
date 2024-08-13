@@ -4580,6 +4580,7 @@ void replace_shard_id_to_zero_handler(rjson::value& data) {
     data.SetString(std::move(str), the_allocator);
 }
 
+// TODO
 bool list_pattern_filter_handler(const rjson::value& data) {
     return false;
 }

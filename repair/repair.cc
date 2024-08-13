@@ -510,10 +510,10 @@ future<> repair::task_manager_module::run(repair_uniq_id id, std::function<void 
             done(id, false);
             return make_exception_future(std::move(ep));
         }).finally([this, id] () {
-            auto f = _rs.get_storage_proxy().invoke_on_all([repair_uuid = id.uuid()] (service::storage_proxy& sp) {
+            rlogger.info("repair[{}]: synctable repair cfg clean complete", id.uuid());
+            return _rs.get_storage_proxy().invoke_on_all([repair_uuid = id.uuid()] (service::storage_proxy& sp) {
                 sp.delete_synctable_repair_cfg(repair_uuid);
             });
-            rlogger.info("repair[{}]: synctable repair cfg clean complete", id.uuid());
         });
     });
 }
@@ -813,7 +813,7 @@ struct repair_options {
 
     int ranges_parallelism = -1;
     // for synctable repair
-    sstring target_table_name = "";
+    sstring target_table_name;
     std::vector<sstring> target_table_keys;
     std::vector<sstring> ipports;
     std::vector<sstring> projections;
@@ -821,10 +821,11 @@ struct repair_options {
     std::vector<sstring> column_alter_method;
     std::vector<sstring> column_filter;
     std::vector<sstring> column_filter_method;
-    int batch_row_limit = INT_MAX;
-    bool incr_sync = false;
+    int batch_row_limit = 0;
     bool read_before_write = false;
     int max_connections = 0;
+    uint64_t peer_ops = 0;
+    bool incremental = false;
 
     repair_options(std::unordered_map<sstring, sstring> options) {
         bool_opt(primary_range, options, PRIMARY_RANGE_KEY);
@@ -843,13 +844,12 @@ struct repair_options {
         list_opt(column_filter, options, COLUMN_FILTER_LIST_KEY);
         list_opt(column_filter_method, options, COLUMN_FILTER_METHOD_LIST_KEY);
         int_opt(batch_row_limit, options, BATCH_ROW_LIMIT_INT_KEY);
-        bool_opt(incr_sync, options, INCREMENTAL_SYNCTABLE_BOOL_KEY);
         bool_opt(read_before_write, options, READ_BEFORE_WRITE_BOOL_KEY);
         int_opt(max_connections, options, MAX_CONNECTIONS_INT_KEY);
+        ullint_opt(peer_ops, options, PEER_OPS_ULLINT_KEY);
         // We currently do not support incremental repair. We could probably
         // ignore this option as it is just an optimization, but for now,
         // let's make it an error.
-        bool incremental = false;
         bool_opt(incremental, options, INCREMENTAL_KEY);
         if (incremental) {
             throw std::runtime_error("unsupported incremental repair");
@@ -907,9 +907,9 @@ struct repair_options {
     static constexpr const char* COLUMN_FILTER_LIST_KEY = "column_filter";
     static constexpr const char* COLUMN_FILTER_METHOD_LIST_KEY = "column_filter_method";
     static constexpr const char* BATCH_ROW_LIMIT_INT_KEY = "batch_row_limit";
-    static constexpr const char* INCREMENTAL_SYNCTABLE_BOOL_KEY = "incr_sync";
     static constexpr const char* READ_BEFORE_WRITE_BOOL_KEY = "read_before_write";
     static constexpr const char* MAX_CONNECTIONS_INT_KEY = "max_connections";
+    static constexpr const char* PEER_OPS_ULLINT_KEY = "peer_ops";
 
     // Settings of "parallelism" option. Numbers must match Cassandra's
     // RepairParallelism enum, which is used by the caller.
@@ -942,6 +942,20 @@ private:
             var = strtol(it->second.c_str(), nullptr, 10);
             if (errno) {
                 throw(std::runtime_error(format("cannot parse integer: '{}'", it->second)));
+            }
+            options.erase(it);
+        }
+    }
+
+    static void ullint_opt(uint64_t& var,
+            std::unordered_map<sstring, sstring>& options,
+            const sstring& key) {
+        auto it = options.find(key);
+        if (it != options.end()) {
+            errno = 0;
+            var = strtoull(it->second.c_str(), nullptr, 10);
+            if (errno) {
+                throw(std::runtime_error(format("cannot parse unsigned long long integer: '{}'", it->second)));
             }
             options.erase(it);
         }
@@ -1107,6 +1121,43 @@ future<> repair::shard_repair_task_impl::run() {
     co_return;
 }
 
+// for alternator, the keyspace name will looks like alternator_xxx_yyy or "alternator_xxx-yyy"
+// and the base table for this keyspace will looks like xxx_yyy or "xxx-yyy"
+static bool match_alternator_keyspace_basetable_name(const sstring& keyspace, const sstring& base_tablename) {
+    if (keyspace.starts_with('\"')) {
+        if (!base_tablename.starts_with('\"')) {
+            return false;
+        }
+        return (base_tablename.substr(keyspace.find('\"') + 1) == keyspace.substr(keyspace.find('_') + 1));
+    }
+    return (base_tablename == keyspace.substr(keyspace.find('_') + 1));
+}
+
+// calculate the maximum http_connection threads according to the endpoint(http_client) num, e2 core num, batch_num and the e3 ops(k).
+// before we use this limit:
+// (endpoint_num * max_connections_per_http_client * shard_num * batch_put_num * (1000ms / average_batch_put_latency(35ms))) = ops (20K ops for e3)
+// after this connection limit:
+// (CONNECTION_LIMIT * shard_num * batch_put_num * (1000ms / average_batch_put_latency(35ms))) = ops (20K ops for e3)
+// ATTENTION!!! for most of time, the limit is 1 for e3.
+
+// expected_srps = ops / shard_num
+// limit * batch_num * round_num = expected_srps ----> round_num = expected_srps / (limit * batch_num) ----> round_num = (ops / shard_num) / (limit * batch_num)
+// expected_round_milliseconds * round_num = 1000ms ----> expected_round_milliseconds = (1000ms) / round_num
+static std::tuple<uint32_t, uint32_t> get_concurr_limit_and_round_millis(uint32_t batch_num, uint64_t ops) {
+    // the batch_put latency for e3 is approximately half of the batch_put_num.
+    uint32_t average_batch_put_latency_millis = batch_num / 2;
+    // the estimated thread_round per second should not be greater than 30 (1000ms / 35ms ≈ 30), otherwise the limit
+    // will be 1 for most of the time.
+    uint32_t thread_round_per_sec = std::min((uint32_t)1000 / average_batch_put_latency_millis, (uint32_t)30);
+    uint32_t shard_num = smp::count;
+    uint32_t limit = (uint32_t)(std::ceil((double)ops / (double)(shard_num * batch_num * thread_round_per_sec)));
+
+    uint64_t round_num = (ops / (uint64_t)shard_num) / (limit * (uint64_t)batch_num);
+    uint64_t expected_round_milliseconds = (uint64_t)1000 / round_num;
+
+    return {limit, expected_round_milliseconds};
+}
+
 // repair_start() can run on any cpu; It runs on cpu0 the function
 // do_repair_start(). The benefit of always running that function on the same
 // CPU is that it allows us to keep some state (like a list of ongoing
@@ -1141,53 +1192,58 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
 
     // synctable repair config
     if (options.target_table_name != "") {
-        if (!keyspace.starts_with("alternator_")) {
+        // support alternator only right now.
+        if (!keyspace.starts_with("alternator_") && !keyspace.starts_with("\"alternator_")) {
             throw std::runtime_error("synctable repair support only alternator table.");
         }
 
         alternator::validate_table_name(std::string(options.target_table_name.c_str()));
 
-        if (!options.incr_sync) {
+        // for fully synctable-repair, we must specify the taget table to sync data
+        // for incremental-repair, we allow the repair process for other table in the same keyspace without data sync.
+        if (!options.incremental) {
+            // fully synctable repair must specify the base table as the sync-repair table.
             if (options.column_families.size() != 1) {
-                throw std::runtime_error("fully synctable repair need a specified table name.");
+                throw std::runtime_error("fully synctable repair must specify the base table as the sync-repair table.");
             }
-            if (options.column_families[0] != keyspace.substr(keyspace.find('_') + 1)) {
-                throw std::runtime_error(format("the specified table name for fully repair-sync need to be the base table while keyspace {} and specified table name {}.",
+
+            // compare the keyspace name and the base table name.
+            if (!match_alternator_keyspace_basetable_name(keyspace, options.column_families[0])) {
+                throw std::runtime_error(
+                    format("the specified table name for fully repair-sync need to be the base table while keyspace name is : {} and specified table name is: {}.",
                     keyspace, options.column_families[0]));
             }
-        } else {
-            throw std::runtime_error("only support fully synctable repair for this version.");
         }
 
-        service::storage_proxy::synctable_within_repair_config cfg;
+        service::storage_proxy::synctable_repair_config cfg;
         cfg.target_table_name = options.target_table_name;
-        cfg.incr_sync = options.incr_sync;
         cfg.read_before_write = options.read_before_write;
 
         if (options.batch_row_limit <= 0 || options.max_connections < 0) {
             throw std::runtime_error("batch_row_limit and max_connections must be great than 0.");
         }
         cfg.batch_row_limit = options.batch_row_limit;
-        cfg.max_connections_for_each_socket = options.max_connections;
+        cfg.max_conns_per_client = options.max_connections;
 
         if (options.ipports.size() == 0) {
             throw std::runtime_error("synctable repair need ips param.");
         }
 
         for (auto& ipport : options.ipports) {
-            std::optional<std::pair<std::string, unsigned>> ipport_opt = service::validate_and_extract_ip_port(std::string(ipport));
+            // pair<std::string ip, uint32_t port>
+            std::optional<std::pair<std::string, uint32_t>> ipport_opt = service::validate_and_extract_ip_port(std::string(ipport));
             if (!ipport_opt.has_value()) {
                 throw std::runtime_error("synctable repair ips param formate error, which should be like ip:port format.");
             }
-            cfg.destips.emplace_back(std::move(ipport_opt.value()));
+            cfg.dest_ip_port_arr.emplace_back(std::move(ipport_opt.value()));
         }
 
         if (cfg.read_before_write == true && options.target_table_keys.size() == 0) {
-            throw std::runtime_error("target_table_keys is necessary if read_before_write is true.");
+            throw std::runtime_error("target_table_keys is necessary for read_before_write to format read query.");
         }
         std::set<sstring> target_table_key_set(options.target_table_keys.begin(), options.target_table_keys.end());
         if (target_table_key_set.size() != options.target_table_keys.size()) {
-            throw std::runtime_error("target_table_keys param should be unique.");
+            throw std::runtime_error("target table keys param should be unique.");
         }
 
         if (options.projections.size() != 0) {
@@ -1198,11 +1254,14 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
             cfg.attrs = std::move(options.projections);
             cfg.opts.set<service::storage_proxy::synctable_option::projection>();
 
+            // column_alter means we may change the value during the synctable process.
             std::set<sstring> column_alter_set(options.column_alter.begin(), options.column_alter.end());
             if (column_alter_set.size() != options.column_alter.size()) {
                 throw std::runtime_error("synctable repair column_alter param should be unique.");
             }
 
+            // column_filter means that not all rows will be synced according to the column-filter rules.
+            // column_filter is for row-filter while projection is for column-filter.
             std::set<sstring> column_filter_set(options.column_filter.begin(), options.column_filter.end());
             if (column_filter_set.size() != options.column_filter.size()) {
                 throw std::runtime_error("synctable repair column_filter param should be unique.");
@@ -1232,12 +1291,10 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
         }
 
         std::unordered_map<sstring, service::storage_proxy::synctable_column_alter_method> alter_method_str_to_enum_map = {
-            { "null", service::storage_proxy::synctable_column_alter_method::null },
             { "replace_shard_id_to_zero", service::storage_proxy::synctable_column_alter_method::replace_shard_id_to_zero },
         };
 
         std::unordered_map<sstring, service::storage_proxy::synctable_column_filter_method> filter_method_str_to_enum_map = {
-            { "null", service::storage_proxy::synctable_column_filter_method::null },
             { "list_pattern", service::storage_proxy::synctable_column_filter_method::list_pattern },
         };
 
@@ -1264,6 +1321,23 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
         }
 
         cfg.opts.set<service::storage_proxy::synctable_option::fully>();
+
+        // set the maximum http-connection-concurrent-num to control the ops to e3.
+        if (options.peer_ops <= 0) {
+            throw std::runtime_error("peer_ops must be great than 0.");
+        }
+
+        if (options.peer_ops >= 1000000) {
+            // unlimited
+            cfg.http_conn_resource = std::numeric_limits<uint32_t>::max();
+            cfg.expected_transport_latency = 0;
+        } else {
+            auto [http_conn_resource, expected_transport_latency] = get_concurr_limit_and_round_millis(cfg.batch_row_limit, options.peer_ops);
+            cfg.http_conn_resource = http_conn_resource;
+            cfg.expected_transport_latency = expected_transport_latency;
+        }
+
+        rlogger.debug("repair[{}]: config http_conn_resource as {} and expected_transport_latency as {}ms.", id.uuid(), cfg.http_conn_resource, cfg.expected_transport_latency);
 
         co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
             return sp.insert_synctable_repair_cfg(repair_uuid, cfg);

@@ -72,6 +72,8 @@
 #include <seastar/core/when_all.hh>
 #include "service/storage_service.hh"
 #include "alternator/conditions.hh"
+#include <seastar/core/sleep.hh>
+#include <seastar/http/exception.hh>
 
 extern logging::logger rlogger;
 
@@ -226,8 +228,9 @@ struct row_level_repair_metrics {
     enum class synctable_error_code : uint8_t {
         normal = 0,
         read_page_error,
-        data_transport_timeout,
         data_transport_unexception,
+        data_transport_timeout,
+        data_transport_internal_error,
     };
 
     void error_indicate(synctable_error_code error_code) {
@@ -2103,13 +2106,11 @@ private:
     };
 
     struct synctable_common_param {
-        const lw_shared_ptr<service::storage_proxy::synctable_within_repair_config> cfg;
+        lw_shared_ptr<service::storage_proxy::synctable_repair_config_pershard> cfg;
         query::partition_slice slice;
         std::optional<alternator::attrs_to_get> attrs;
         shared_ptr<cql3::selection::selection> selection;
-        // the bool variable means whether will we use this client in this repair round.
-        std::vector<std::pair<lw_shared_ptr<service::storage_proxy::dynamodb_client_wrap>, bool>> synctable_http_clients;
-        uint64_t start_index;
+        uint64_t start_index; // for load balance.
     };
 
     lw_shared_ptr<compact_for_query_state_v2> _synctable_compaction_state = nullptr;
@@ -2252,47 +2253,54 @@ private:
     }
 
     future<sstring> synctable_data_transport(temporary_buffer<char> transport_data, dynamodb::client::opcode_type opcode) {
-        uint32_t dest_ip_size = _synctable_common_param->synctable_http_clients.size();
-        uint32_t retry_time = 0; // try all the endpoint for timeout exception. the maximum retry time is the size of endpoint.
+        uint32_t dest_ip_size = _synctable_common_param->cfg->synctable_http_clients.size();
+        uint32_t interal_error_retry_time = 20;
+        uint32_t tried_client = 0; // try all the endpoint for timeout exception. the maximum retry time is the size of endpoint.
+        uint32_t database_timeout_retry_time = 0; // for some e3 internal timeout error, we should wait for some time and try again.
+        std::chrono::milliseconds timeout_retry_ms(100);
         std::exception_ptr ex = nullptr;
+        bool internal_server_error = false;
 
-        while (retry_time < dest_ip_size) {
+        while (tried_client < dest_ip_size && database_timeout_retry_time < interal_error_retry_time) {
+            if (_synctable_common_param->cfg->cfg.error_occurred) {
+                co_return coroutine::exception(std::make_exception_ptr(std::runtime_error("find cfg.error_occurred, stop all repair action.")));
+            }
+
             uint32_t curr_client_index = _synctable_common_param->start_index % dest_ip_size;
-            // this client has emited a timeout error for this repair round, tag it as unreachable and ignore it for the following repair round.
-            if (_synctable_common_param->synctable_http_clients[curr_client_index].second == false) {
+            // this http-client has emited a timeout error for this sync-repair process, tag it as unreachable and ignore it for the following process.
+            if (_synctable_common_param->cfg->synctable_http_clients[curr_client_index].second == false) {
                 _synctable_common_param->start_index++;
-                retry_time++;
+                tried_client++;
                 continue;
             }
 
-            auto dynamodb_client_wrap_ptr = _synctable_common_param->synctable_http_clients[curr_client_index].first;
-            // this client has been taged as unhealthy.
-            if (service::storage_proxy::validate_dynamodb_client(dynamodb_client_wrap_ptr) == false) {
-                _synctable_common_param->synctable_http_clients[curr_client_index].second = false;
-                _synctable_common_param->start_index++;
-                retry_time++;
-                continue;
-            }
+            auto dynamodb_client_wrap_ptr = _synctable_common_param->cfg->synctable_http_clients[curr_client_index].first;
 
             try {
-                // operate will return normal future or a exception future(instead of throw, if throw, you will need coroutine::as_future), when get or co_await, try block will catch this exception.
-                sstring reply_message = co_await dynamodb_client_wrap_ptr->client->operate(std::move(transport_data), opcode);
+                // operate will return normal future or a exception which can be catched by try-block.
+                temporary_buffer<char> curr_transport_data = transport_data.clone();
+                sstring reply_message = co_await dynamodb_client_wrap_ptr->client->operate(std::move(curr_transport_data), opcode);
                 // if request success, return immediately.
                 _synctable_common_param->start_index++;
                 co_return reply_message;
-
+            // no response, timeout exception.
             } catch (const std::system_error& error) {
-                // timeout exception
-                if (error.code().value() == 110) {
-                    // use slb so don't tag any unhealthy client to wait for 30mins.
-                    // service::storage_proxy::tag_dynamodb_client_unhealthy(dynamodb_client_wrap_ptr);
-                    _synctable_common_param->synctable_http_clients[curr_client_index].second = false;
+                ex = std::current_exception();
+                if (error.code().value() == ETIMEDOUT) {
+                    _synctable_common_param->cfg->synctable_http_clients[curr_client_index].second = false;
                     _synctable_common_param->start_index++;
-                    retry_time++;
+                    tried_client++;
                     continue;
                 } else {
                     // other exception
-                    ex = std::current_exception();
+                    break;
+                }
+            } catch (const seastar::httpd::unexpected_status_error& error) {
+                ex = std::current_exception();
+                if (error.status() == http::reply::status_type::internal_server_error) {
+                    internal_server_error = true;
+                } else {
+                    // other exception
                     break;
                 }
             } catch (...) {
@@ -2300,44 +2308,68 @@ private:
                 ex = std::current_exception();
                 break;
             }
+
+            if (internal_server_error) {
+                database_timeout_retry_time++;
+                co_await seastar::sleep(timeout_retry_ms);
+                timeout_retry_ms += std::chrono::milliseconds(100);
+                internal_server_error = false;
+            }
         }
-        if (ex) {
+
+        if (tried_client == dest_ip_size) {
+            _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_timeout);
+        } else if (database_timeout_retry_time == interal_error_retry_time) {
+            _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_internal_error);
+        } else {
             _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_unexception);
-            co_return coroutine::exception(std::move(ex));
         }
-        // timeout, return exception
-        _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::data_transport_timeout);
-        co_return coroutine::exception(std::make_exception_ptr(std::runtime_error("all client timeout")));
+
+        co_return coroutine::exception(std::move(ex));
+
     }
 
-    // in this function, we will send batchWrite Request to the other database cluster
-    // we will tag the timeout client as unhealthy and try the other client. 
+    // in this function, we will send read request(if read_before_write=true) and batch write Request to the other database cluster,
+    // we will tag the timeout client as unhealthy for this repair process and try the other client.
     // if all client timeout or some other error emitted, we failed and return the expection future.
-    future<> send_synctable_request(rjson::value batch_write_items, rjson::value batch_read_items, sstring& table_name) {
+    future<> send_synctable_request_impl(rjson::value batch_write_items, rjson::value batch_read_items, sstring& table_name) {
         std::string temp_data;
         auto& write_arr = batch_write_items["RequestItems"][table_name];
         uint64_t duplicated_row_nr = 0;
-        // read data from the endpoint first, and then send the missing data.
+        lowres_clock::time_point start_time;
 
-        if (_synctable_common_param->cfg->read_before_write) {
+        // read data from the endpoint first, and then send the missing data.
+        if (_synctable_common_param->cfg->cfg.read_before_write) {
             temp_data = rjson::print(batch_read_items);
             temporary_buffer<char> transport_read_data(temp_data.c_str(), temp_data.length());
-            auto fut = co_await coroutine::as_future(synctable_data_transport(std::move(transport_read_data), dynamodb::client::opcode_type::batch_get_item));
-            if (fut.failed()) {
-                co_return co_await seastar::coroutine::exception(fut.get_exception());
-            }
-            auto data = fut.get();
+            // if synctable_data_transport return an exception future, coroutine will throw.
+            // you can catch this throw to handle it, otherwise, it will be captured by coroutine and returned as an exceptional future.
+            // we do not need to handle this exception here, so just co_await it.
+            start_time = lowres_clock::now();
+            auto data = co_await synctable_data_transport(std::move(transport_read_data), dynamodb::client::opcode_type::batch_get_item).then(
+                [start_time = std::move(start_time), expected_dur = _synctable_common_param->cfg->cfg.expected_transport_latency] (sstring res) -> future<sstring> {
+                uint32_t duration = std::chrono::duration_cast<std::chrono::duration<uint32_t, std::milli>>(lowres_clock::now() - start_time).count();
+                if (duration < expected_dur) {
+                    std::chrono::milliseconds ops_control_delay(expected_dur - duration);
+                    co_await seastar::sleep(ops_control_delay);
+                }
+                co_return res;
+            });
             rjson::value resp = rjson::parse(data);
             auto& data_arr = resp["Responses"][table_name];
 
+            // we read some data from the peer database, compare with our data.
             if (data_arr.Size() != 0) {
                 struct json_map_comparator {
                     bool operator()(const rjson::value& lv, const rjson::value& rv) const {
                         return alternator::check_EQ_for_maps(lv, rv);
                     }
                 };
-                // template argument for template type parameter must be a type(if the comparator is a param for a func, then you can pass check_EQ_for_maps directly.)
-                // use unordered_set instead of set, because set need to pass the comparator as a param, but we cannot offer a comparator for rjson::value.
+                // template argument for template type parameter must be a type,
+                // if the comparator is a param for a func, then you can pass check_EQ_for_maps directly. 
+                // but for template param, we must warp check_EQ_for_maps into a class or struct.
+                // use std::unordered_set instead of std::set, because std::set need to pass the comparator(<) as a param,
+                // but we cannot offer a comparator(<) for rjson::value.
                 std::unordered_set<rjson::value, rjson::json_value_hasher, json_map_comparator> existed_data;
 
                 for (auto& item : data_arr.GetArray()) {
@@ -2362,13 +2394,32 @@ private:
         temp_data = rjson::print(batch_write_items);
         _metrics.update_synced_row_nr_meta(write_arr.Size(), duplicated_row_nr, temp_data.length());
         temporary_buffer<char> transport_write_data(temp_data.c_str(), temp_data.length());
-        co_return co_await synctable_data_transport(std::move(transport_write_data), dynamodb::client::opcode_type::batch_write_item).discard_result();
+
+        start_time = lowres_clock::now();
+        co_return co_await synctable_data_transport(std::move(transport_write_data), dynamodb::client::opcode_type::batch_write_item).discard_result().then(
+            [start_time = std::move(start_time), expected_dur = _synctable_common_param->cfg->cfg.expected_transport_latency] () {
+            uint64_t duration = std::chrono::duration_cast<std::chrono::duration<uint64_t, std::milli>>(lowres_clock::now() - start_time).count();
+            if (duration < expected_dur) {
+                std::chrono::milliseconds ops_control_delay(expected_dur - duration);
+                return seastar::sleep(ops_control_delay);
+            }
+            return make_ready_future<>();
+        });
+    }
+
+    // limit the maximum http_connection threads
+    future<> send_synctable_request(rjson::value batch_write_items, rjson::value batch_read_items, sstring& table_name) {
+        return seastar::with_semaphore(_synctable_common_param->cfg->http_conn_limit, 1,
+            [this, bw = std::move(batch_write_items), br = std::move(batch_read_items), &table_name]() mutable {
+            return send_synctable_request_impl(std::move(bw), std::move(br), table_name);
+        });
     }
 
 public:
-    // @return: 1 means some error occurred during synctable process and we don't want to continue the following repair process while 0 means keep going on.
+    // @return: 
+    // 1 means some error occurred during synctable process and we don't want to continue the following repair process (fully synctable failed)
+    // 0 means no matter what happened during the sync process, the repair process should keep going on. (fully synctable success or inc synctable repair)
     future<int> synctable_in_repair(bool use_working_row_buf) {
-        // only incremental sync-repair will run this part while the fully sync will throw error when sync fail.
         if (_synctable_flag.has_value()) {
             if (!_synctable_flag.value()) {
                 co_return co_await make_ready_future<int>(0);
@@ -2387,7 +2438,7 @@ public:
             }
 
             service::storage_proxy& local_sp = _rs.get_storage_proxy().local();
-            const lw_shared_ptr<service::storage_proxy::synctable_within_repair_config> cfg = local_sp.get_synctable_repair_cfg(_repair_task_id);
+            lw_shared_ptr<service::storage_proxy::synctable_repair_config_pershard> cfg = local_sp.get_synctable_repair_cfg(_repair_task_id);
             // only normal nodetool repair has no cfg.
             if (!cfg) {
                 _synctable_flag = false;
@@ -2396,13 +2447,13 @@ public:
 
             if (!_synctable_common_param) {
                 std::optional<alternator::attrs_to_get> attrs = std::nullopt;
-                const auto projection = cfg->opts.contains<service::storage_proxy::synctable_option::projection>();
+                const auto projection = cfg->cfg.opts.contains<service::storage_proxy::synctable_option::projection>();
                 bool skip_regular_columns = true;
                 std::vector<const column_definition*> cds;
 
                 if (projection) {
                     alternator::attrs_to_get maps;
-                    for (sstring& attr : cfg->attrs) {
+                    for (sstring& attr : cfg->cfg.attrs) {
                         using node = alternator::attribute_path_map_node<std::monostate>;
                         auto it = maps.find(attr);
                         if (it == maps.end()) {
@@ -2428,12 +2479,13 @@ public:
                     regular_columns = {};
                     selection = cql3::selection::selection::for_columns(_schema, cds);
                     // if no data need to be transfered, we can increase _synctable_row_limit to 2000.
-                    _synctable_row_limit = std::min(uint32_t(2000), cfg->batch_row_limit);
+                    _synctable_row_limit = std::min(uint32_t(2000), cfg->cfg.batch_row_limit);
                 } else {
                     regular_columns = boost::copy_range<query::column_id_vector>(
-                        _schema->regular_columns() | boost::adaptors::filtered([] (const column_definition& cdef) { return !cdef.is_view_virtual();}) | boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.id; }));
+                        _schema->regular_columns() | boost::adaptors::filtered([] (const column_definition& cdef) { return !cdef.is_view_virtual();}) |
+                        boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.id; }));
                     selection = cql3::selection::selection::wildcard(_schema);
-                    _synctable_row_limit = std::min(_synctable_row_limit, cfg->batch_row_limit);
+                    _synctable_row_limit = std::min(_synctable_row_limit, cfg->cfg.batch_row_limit);
                 }
 
                 query::partition_slice::option_set curr_opts = selection->get_query_options();
@@ -2441,13 +2493,8 @@ public:
                 auto slice = query::partition_slice(std::move(ck_bounds), {}, std::move(regular_columns), curr_opts);
                 slice.options.set<query::partition_slice::option::allow_short_read>();
 
-                std::vector<std::pair<lw_shared_ptr<service::storage_proxy::dynamodb_client_wrap>, bool>> synctable_http_clients;
-                for (auto destip : cfg->destips) {
-                    auto synctable_http_client_ptr = local_sp.find_or_create_dynamodb_client(destip.first, destip.second, cfg->max_connections_for_each_socket);
-                    synctable_http_clients.push_back({synctable_http_client_ptr, true});
-                }
-                uint64_t start_index = get_random_seed() % synctable_http_clients.size();
-                synctable_common_param synctable_common_param_value = {cfg, std::move(slice), std::move(attrs), selection, std::move(synctable_http_clients), start_index};
+                uint64_t start_index = get_random_seed() % cfg->synctable_http_clients.size();
+                synctable_common_param synctable_common_param_value = {cfg, std::move(slice), std::move(attrs), selection, start_index};
                 _synctable_common_param = make_lw_shared<synctable_common_param>(std::move(synctable_common_param_value));
             }
 
@@ -2456,6 +2503,12 @@ public:
             }
             _metrics.init_synced_row_nr_meta(_repair_task_id.uuid());
             _synctable_flag = true;
+
+            // To prevent e3 from being overwhelmed by the initial surge in data traffic,
+            // we let each thread to sleep for a while in the beginning.
+            uint64_t random_sleep_millis = get_random_seed() % (uint64_t)1000;
+            std::chrono::milliseconds random_sleep_time(random_sleep_millis);
+            co_await seastar::sleep(random_sleep_time);
         }
 
         std::list<repair_row>& row_buf = use_working_row_buf ?  _working_row_buf : _row_buf;
@@ -2469,7 +2522,7 @@ public:
 
         auto it = compacted_rows.begin();
         while (it != compacted_rows.end()) {
-            // Use coroutine::as_future to prevent exception on timesout.
+            // don't throw directly here, we will do something for failed case, so wrap it as future.
             auto f = co_await coroutine::as_future(synctable_consume_new_page(it, compacted_rows.end()));
             if (!f.failed()) {
                 query::result query_result = std::move(f).get0();
@@ -2481,19 +2534,22 @@ public:
                 }
 
                 auto [batch_write_items, batch_read_items] = alternator::get_batch_write_read_item_format(std::move(json_items),
-                    _synctable_common_param->cfg->target_table_name, _synctable_common_param->cfg->target_table_keys,
-                    _synctable_common_param->cfg->read_before_write, _synctable_common_param->cfg->altered_columns,
-                    _synctable_common_param->cfg->filtered_columns);
+                    _synctable_common_param->cfg->cfg.target_table_name, _synctable_common_param->cfg->cfg.target_table_keys,
+                    _synctable_common_param->cfg->cfg.read_before_write, _synctable_common_param->cfg->cfg.altered_columns,
+                    _synctable_common_param->cfg->cfg.filtered_columns);
 
-                res.push_back(send_synctable_request(std::move(batch_write_items), std::move(batch_read_items), _synctable_common_param->cfg->target_table_name));
+                res.push_back(send_synctable_request(std::move(batch_write_items), std::move(batch_read_items),
+                    _synctable_common_param->cfg->cfg.target_table_name));
             } else {
                 rlogger.error("synctable_consume_new_page failed {}", f.get_exception());
                 // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
                 _synctable_flag = false;
                 _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::read_page_error);
-                // if its incr_ysnc, just ignore the sync error.
-                if (_synctable_common_param->cfg->incr_sync) {
-                    co_return co_await make_ready_future<int>(0);
+                // tag all shard cfg error_flag to be error.
+                if (!_synctable_common_param->cfg->cfg.error_occurred) {
+                    co_await _rs.get_storage_proxy().invoke_on_all([id = _repair_task_id] (service::storage_proxy& sp) {
+                        return sp.tag_synctable_repair_error(id);
+                    });
                 }
                 co_return co_await make_ready_future<int>(1);
             }
@@ -2507,9 +2563,16 @@ public:
             rlogger.error("synctable_send_data failed: {}", ep);
             // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
             _synctable_flag = false;
+            // tag all shard cfg error_flag to be error.
+            if (!_synctable_common_param->cfg->cfg.error_occurred) {
+                return _rs.get_storage_proxy().invoke_on_all([id = this->_repair_task_id] (service::storage_proxy& sp) {
+                    return sp.tag_synctable_repair_error(id);
+                });
+            }
+            return seastar::make_ready_future<>();
         });
 
-        if (_synctable_common_param->cfg->incr_sync == false && _synctable_flag.value() == false) {
+        if (!_synctable_flag.value() || _synctable_common_param->cfg->cfg.error_occurred) {
             co_return co_await make_ready_future<int>(1);
         }
         co_return co_await make_ready_future<int>(0);

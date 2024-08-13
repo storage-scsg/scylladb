@@ -310,8 +310,7 @@ inline rjson::value get_read_item_from_write_item(const rjson::value& write_item
     for (auto it = write_item.MemberBegin(); it != write_item.MemberEnd(); ++it) {
         std::string_view key = rjson::to_string_view(it->name);
         if (std::find(target_table_keys.begin(), target_table_keys.end(), key) != target_table_keys.end()) {
-            rjson::value read_value = rjson::copy(it->value);
-            rjson::add_with_string_name(read_item, key, std::move(read_value));
+            rjson::add_with_string_name(read_item, key, rjson::copy(it->value));
             curr_size++;
             if (curr_size == key_size) {
                 break;
@@ -370,7 +369,8 @@ SEASTAR_CONCEPT( requires requires (Iterator i) {
      { i != i } -> std::convertible_to<bool>;
      std::same_as<std::remove_reference_t<decltype(*i)>, rapidjson::Value>;
 } )
-// we must format read and write json togather, bacause the key used to read or write may be altered (replace_shard_id_to_zero for example) during the following code.
+// we must format read and write json togather, bacause the key used to read or write may be altered (replace_shard_id_to_zero for example)
+// during the following code.
 inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format_impl(Iterator start, Iterator end,
     std::string_view table_name, std::vector<sstring>& target_table_keys, bool read_before_write,
     const std::vector<std::pair<sstring, service::storage_proxy::synctable_column_alter_method>>& altered_columns,
@@ -402,15 +402,14 @@ inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format_i
         bool filtered = false;
 
         for (auto& filtered_column : filtered_columns) {
-            if (filtered_column.second != service::storage_proxy::synctable_column_filter_method::null) {
-                auto column_iter = item.FindMember(filtered_column.first);
-                if (column_iter != item.MemberEnd()) {
-                    rjson::value& data = (column_iter->value).MemberBegin()->value;
-                    // if filter return ture, is means that this record donot need to be synced.
-                    if (filter_method_map.at(filtered_column.second)(data)) {
-                        filtered = true;
-                        break;
-                    }
+            // find the column which need to check its filter rule.
+            auto column_iter = item.FindMember(filtered_column.first);
+            if (column_iter != item.MemberEnd()) {
+                rjson::value& data = (column_iter->value).MemberBegin()->value;
+                // if filter return true, is means that this record will be filtered and do not need to be synced.
+                if (filter_method_map.at(filtered_column.second)(data)) {
+                    filtered = true;
+                    break;
                 }
             }
         }
@@ -420,12 +419,10 @@ inline std::tuple<rjson::value, rjson::value> get_batch_write_read_item_format_i
         }
 
         for (auto& altered_column : altered_columns) {
-            if (altered_column.second != service::storage_proxy::synctable_column_alter_method::null) {
-                auto column_iter = item.FindMember(altered_column.first);
-                if (column_iter != item.MemberEnd()) {
-                    rjson::value& data = (column_iter->value).MemberBegin()->value;
-                    alter_method_map.at(altered_column.second)(data);
-                }
+            auto column_iter = item.FindMember(altered_column.first);
+            if (column_iter != item.MemberEnd()) {
+                rjson::value& data = (column_iter->value).MemberBegin()->value;
+                alter_method_map.at(altered_column.second)(data);
             }
         }
 

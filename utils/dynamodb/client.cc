@@ -179,6 +179,7 @@ future<sstring> client::make_request(http::request req, reply_handler_ext handle
     return gc.http.make_request(std::move(req), std::move(handle), expected);
 }
 
+// return the response message or an exception future with error
 future<sstring> client::operate(temporary_buffer<char> buf, opcode_type op_code)
 {
     auto req = http::request::make("POST", _host, "/");
