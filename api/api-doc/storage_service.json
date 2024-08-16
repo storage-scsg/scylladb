@@ -1019,7 +1019,9 @@
                "enum":[
                   "RUNNING",
                   "SUCCESSFUL",
-                  "FAILED"
+                  "FAILED",
+                  "FAILED_500",
+                  "FAILED_400"
                ],
                "nickname":"repair_await_completion",
                "produces":[
@@ -1275,7 +1277,9 @@
                "enum":[
                   "RUNNING",
                   "SUCCESSFUL",
-                  "FAILED"
+                  "FAILED",
+                  "FAILED_500",
+                  "FAILED_400"
                ],
                "nickname":"repair_async_status",
                "produces":[

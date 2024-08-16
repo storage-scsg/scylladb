@@ -203,7 +203,7 @@ private:
     named_semaphore _range_parallelism_semaphore;
     seastar::condition_variable _done_cond;
     void start(repair_uniq_id id);
-    void done(repair_uniq_id id, bool succeeded);
+    void done(repair_uniq_id id, bool succeeded, uint32_t error_code = 0);
 public:
     static constexpr size_t max_repair_memory_per_range = 32 * 1024 * 1024;
 

@@ -371,13 +371,19 @@ void repair::task_manager_module::start(repair_uniq_id id) {
     _status[id.id] = repair_status::RUNNING;
 }
 
-void repair::task_manager_module::done(repair_uniq_id id, bool succeeded) {
+void repair::task_manager_module::done(repair_uniq_id id, bool succeeded, uint32_t error_code) {
     _pending_repairs.erase(id.uuid());
     _aborted_pending_repairs.erase(id.uuid());
     if (succeeded) {
         _status.erase(id.id);
     } else {
-        _status[id.id] = repair_status::FAILED;
+        if (error_code == 500) {
+            _status[id.id] = repair_status::FAILED_500;
+        } else if (error_code == 400) {
+            _status[id.id] = repair_status::FAILED_400;
+        } else {
+            _status[id.id] = repair_status::FAILED;
+        }   
     }
     _done_cond.broadcast();
 }
@@ -507,7 +513,14 @@ future<> repair::task_manager_module::run(repair_uniq_id id, std::function<void 
             rlogger.info("repair[{}]: completed successfully, curr time: {} with version 2.0", id.uuid(), db_clock::now());
             done(id, true);
         }).handle_exception([this, id] (std::exception_ptr ep) {
-            done(id, false);
+            service::storage_proxy::return_code error_code = _rs.get_storage_proxy().local().get_synctable_repair_error(id.uuid());
+            if (error_code == service::storage_proxy::return_code::bad_request) {
+                done(id, false, 400);
+            } else if (error_code == service::storage_proxy::return_code::internal_server_error) {
+                done(id, false, 500);
+            } else {
+                done(id, false);
+            }
             return make_exception_future(std::move(ep));
         }).finally([this, id] () {
             rlogger.info("repair[{}]: synctable repair cfg clean complete", id.uuid());

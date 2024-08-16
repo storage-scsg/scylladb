@@ -2350,8 +2350,8 @@ private:
         bool internal_server_error = false;
 
         while (tried_client < dest_ip_size && database_timeout_retry_time < interal_error_retry_time) {
-            if (_synctable_common_param->cfg->cfg.error_occurred) {
-                co_return coroutine::exception(std::make_exception_ptr(std::runtime_error("find cfg.error_occurred, stop all repair action.")));
+            if (_synctable_common_param->cfg->cfg.synctable_return_code != service::storage_proxy::return_code::ok) {
+                co_return coroutine::exception(std::make_exception_ptr(std::runtime_error("find cfg.synctable_return_code is not ok, stop all repair action.")));
             }
 
             uint32_t curr_client_index = _synctable_common_param->start_index % dest_ip_size;
@@ -2504,13 +2504,10 @@ private:
     }
 
 public:
-    // @return: 
-    // 1 means some error occurred during synctable process and we don't want to continue the following repair process (fully synctable failed)
-    // 0 means no matter what happened during the sync process, the repair process should keep going on. (fully synctable success or inc synctable repair)
-    future<int> synctable_in_repair(bool use_working_row_buf) {
+    future<> synctable_in_repair(bool use_working_row_buf) {
         if (_synctable_flag.has_value()) {
             if (!_synctable_flag.value()) {
-                co_return co_await make_ready_future<int>(0);
+                co_return co_await make_ready_future<>();
             }
         }
 
@@ -2522,7 +2519,7 @@ public:
             // only base table need to be synced (for incremental repair-sync, fully repair-sync need to designate the base table name).
             if (cf_name != expected_table_name) {
                 _synctable_flag = false;
-                co_return co_await make_ready_future<int>(0);
+                co_return co_await make_ready_future<>();
             }
 
             service::storage_proxy& local_sp = _rs.get_storage_proxy().local();
@@ -2530,7 +2527,7 @@ public:
             // only normal nodetool repair has no cfg.
             if (!cfg) {
                 _synctable_flag = false;
-                co_return co_await make_ready_future<int>(0);
+                co_return co_await make_ready_future<>();
             }
 
             if (!_synctable_common_param) {
@@ -2601,7 +2598,7 @@ public:
 
         std::list<repair_row>& row_buf = use_working_row_buf ?  _working_row_buf : _row_buf;
         if (row_buf.size() == 0) {
-            co_return co_await make_ready_future<int>(0);
+            co_return co_await make_ready_future<>();
         }
 
         std::vector<future<>> res;
@@ -2629,41 +2626,56 @@ public:
                 res.push_back(send_synctable_request(std::move(batch_write_items), std::move(batch_read_items),
                     _synctable_common_param->cfg->cfg.target_table_name));
             } else {
-                rlogger.error("synctable_consume_new_page failed {}", f.get_exception());
+                std::exception_ptr ep = f.get_exception();
                 // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
                 _synctable_flag = false;
                 _metrics.error_indicate(row_level_repair_metrics::synctable_error_code::read_page_error);
                 // tag all shard cfg error_flag to be error.
-                if (!_synctable_common_param->cfg->cfg.error_occurred) {
+                if (_synctable_common_param->cfg->cfg.synctable_return_code == service::storage_proxy::return_code::ok) {
                     co_await _rs.get_storage_proxy().invoke_on_all([id = _repair_task_id] (service::storage_proxy& sp) {
-                        return sp.tag_synctable_repair_error(id);
+                        return sp.tag_synctable_repair_error(id, service::storage_proxy::return_code::others);
                     });
                 }
-                co_return co_await make_ready_future<int>(1);
+                co_return co_await make_exception_future(std::move(ep));
             }
         }
 
         if (res.size() == 0) {
-            co_return co_await make_ready_future<int>(0);
+            co_return co_await make_ready_future<>();
         }
 
-        co_await seastar::when_all_succeed(res.begin(), res.end()).discard_result().handle_exception([this] (auto ep) {
-            rlogger.error("synctable_send_data failed: {}", ep);
+        co_await seastar::when_all_succeed(res.begin(), res.end()).discard_result().handle_exception([this] (std::exception_ptr ep) {
             // once some error occurred, don't sync anymore because the data consistency for this turn of repair-sync is not reliable.
             _synctable_flag = false;
             // tag all shard cfg error_flag to be error.
-            if (!_synctable_common_param->cfg->cfg.error_occurred) {
-                return _rs.get_storage_proxy().invoke_on_all([id = this->_repair_task_id] (service::storage_proxy& sp) {
-                    return sp.tag_synctable_repair_error(id);
-                });
+            auto f = make_ready_future<>();
+            try {
+                std::rethrow_exception(ep);
+            } catch (const seastar::httpd::unexpected_status_error& error) {
+                if (_synctable_common_param->cfg->cfg.synctable_return_code == service::storage_proxy::return_code::ok) {
+                    f = _rs.get_storage_proxy().invoke_on_all([id = this->_repair_task_id, error = error] (service::storage_proxy& sp) {
+                        if (error.status() == http::reply::status_type::bad_request) {
+                            return sp.tag_synctable_repair_error(id, service::storage_proxy::return_code::bad_request);
+                        } else if (error.status() == http::reply::status_type::internal_server_error) {
+                            return sp.tag_synctable_repair_error(id, service::storage_proxy::return_code::internal_server_error);
+                        } else {
+                            return sp.tag_synctable_repair_error(id, service::storage_proxy::return_code::others);
+                        }
+                    });
+                }
+            } catch (...) {
+                if (_synctable_common_param->cfg->cfg.synctable_return_code == service::storage_proxy::return_code::ok) {
+                    f = _rs.get_storage_proxy().invoke_on_all([id = this->_repair_task_id] (service::storage_proxy& sp) {
+                        return sp.tag_synctable_repair_error(id, service::storage_proxy::return_code::others);
+                    });
+                }
             }
-            return seastar::make_ready_future<>();
+            return f.then([ep = ep](){
+                return make_exception_future(std::move(ep));
+            });
         });
 
-        if (!_synctable_flag.value() || _synctable_common_param->cfg->cfg.error_occurred) {
-            co_return co_await make_ready_future<int>(1);
-        }
-        co_return co_await make_ready_future<int>(0);
+        co_return co_await make_ready_future<>();
     }
 };
 
@@ -3346,10 +3358,7 @@ private:
                 _skipped_sync_boundary = _common_sync_boundary;
                 rlogger.debug("Skip set skipped_sync_boundary={}", _skipped_sync_boundary);
                 master.stats().round_nr_fast_path_already_synced++;
-                int sync_res = master.synctable_in_repair(false).get();
-                if (sync_res) {
-                    throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
-                }
+                master.synctable_in_repair(false).get();
                 return op_status::next_round;
             } else {
                 _skipped_sync_boundary = std::nullopt;
@@ -3408,10 +3417,7 @@ private:
             // `_working_row_buf` on all the nodes are the same
             // This is the second fast path.
             master.stats().round_nr_fast_path_same_combined_hashes++;
-            int sync_res = master.synctable_in_repair(true).get();
-            if (sync_res) {
-                throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
-            }
+            master.synctable_in_repair(true).get();
             return op_status::next_round;
         }
 
@@ -3505,10 +3511,7 @@ private:
           }
         }
 
-        int sync_res = master.synctable_in_repair(true).get();
-        if (sync_res) {
-            throw std::runtime_error(format("Failed to fully sync-repair {}.", _shard_task.global_repair_id.uuid()));
-        }
+        master.synctable_in_repair(true).get();
         master.flush_rows_in_working_row_buf();
         return op_status::next_step;
     }

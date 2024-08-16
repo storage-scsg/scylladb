@@ -97,7 +97,11 @@ future<int> repair_start(seastar::sharded<repair_service>& repair,
 
 // TODO: Have repair_progress contains a percentage progress estimator
 // instead of just "RUNNING".
-enum class repair_status { RUNNING, SUCCESSFUL, FAILED };
+// FAILED_500: sync_table repair peer dynamodb internal server error
+// FAILED_400: sync_table repair peer dynamodb bad request
+// FAILED: other errors
+// Except for FAILED_500 errors, all other errors require manual intervention.
+enum class repair_status { RUNNING, SUCCESSFUL, FAILED, FAILED_500, FAILED_400 };
 
 enum class repair_checksum {
     legacy = 0,

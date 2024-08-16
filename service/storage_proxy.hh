@@ -738,6 +738,15 @@ public:
         fully, // sync all columns to the target table.
         projection, // sync the projected columns to the target table.
     };
+
+    // sync_table repair peer dynamodb return code
+    enum return_code {
+        ok,                        // 200, represents successful sync_table repair.
+        bad_request,               // 400, representative request body issues.
+        internal_server_error,     // 500, represents internal errors in the peer dynamodb.
+        others                     // represents other errors, such as code errors, besides response errors in synchronizing data sent to peer dynamodb.
+    };
+
     using synctable_option_set = enum_set<super_enum<synctable_option,
         synctable_option::fully,
         synctable_option::projection>>;
@@ -755,7 +764,7 @@ public:
         uint32_t max_conns_per_client = 0;
         uint32_t http_conn_resource;
         uint32_t expected_transport_latency; // the expected batch_put_item operation latency. if the real latency is smaller than it, we have to sleep to control the ops.
-        bool error_occurred = false; // if some error occurred during repair process, set this flag and no more repair process will continue.
+        return_code synctable_return_code = ok;  // if some error occurred during repair process, synctable_return_code is set to errorcode and no more repair process will continue.
     };
 
     struct synctable_repair_config_pershard {
@@ -793,12 +802,20 @@ public:
         _synctable_repair_config_map.erase(id.uuid());
     }
 
-    inline void tag_synctable_repair_error(const tasks::task_id& id) {
+    inline void tag_synctable_repair_error(const tasks::task_id& id, const return_code return_code) {
         auto it = _synctable_repair_config_map.find(id.uuid());
         if (it != _synctable_repair_config_map.end()) {
-            it->second->cfg.error_occurred = true;
+            it->second->cfg.synctable_return_code = return_code;
         }
         return;
+    }
+
+    inline return_code get_synctable_repair_error(const tasks::task_id& id) {
+        auto it = _synctable_repair_config_map.find(id.uuid());
+        if (it != _synctable_repair_config_map.end()) {
+            return it->second->cfg.synctable_return_code;
+        }
+        return return_code::ok;
     }
 };
 
