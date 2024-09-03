@@ -14,8 +14,33 @@
 #include "seastarx.hh"
 #include "utils/estimated_histogram.hh"
 #include "cql3/stats.hh"
+#include "utils/estimated_histogram.hh"
+#include "utils/magic_enum.hh"
 
 namespace alternator {
+
+enum class table_ops_type {
+    BatchGetItem,
+    BatchWriteItem,
+    CreateTable,
+    DeleteItem,
+    DeleteTable,
+    DescribeContinuousBackups,
+    DescribeTable,
+    DescribeTimeToLive,
+    GetItem,
+    ListBackups,
+    ListTagsOfResource,
+    PutItem,
+    Query,
+    Scan,
+    TagResource,
+    UntagResource,
+    UpdateItem,
+    UpdateTable,
+    UpdateTimeToLive,
+    GetRecords
+};
 
 // Object holding per-shard statistics related to Alternator.
 // While this object is alive, these metrics are also registered to be
@@ -23,6 +48,15 @@ namespace alternator {
 class stats {
 public:
     stats();
+    // 自动获取枚举值的数量
+    static constexpr size_t table_ops_type_num = magic_enum::enum_count<table_ops_type>();
+    struct table_stats {
+        std::array<uint64_t, table_ops_type_num> op_count;
+        std::array<utils::time_estimated_histogram, table_ops_type_num> op_latency;
+    };
+
+    std::unordered_map<std::string, table_stats> _table_access;
+    void add_table_access(const std::string& table_name);
     // Count of DynamoDB API operations by types
     struct {
         uint64_t batch_get_item = 0;

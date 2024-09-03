@@ -829,7 +829,6 @@ future<executor::request_return_type> executor::get_records(client_state& client
     if (!schema || !base || !is_alternator_keyspace(schema->ks_name())) {
         throw api_error::resource_not_found(fmt::to_string(iter.table));
     }
-
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
     db::consistency_level cl = db::consistency_level::LOCAL_QUORUM;
@@ -1027,7 +1026,7 @@ future<executor::request_return_type> executor::get_records(client_state& client
         // ugh. figure out if we are and end-of-shard
         auto normal_token_owners = _proxy.get_token_metadata_ptr()->count_normal_token_owners();
 
-        return _sdks.cdc_current_generation_timestamp({ normal_token_owners }).then([this, iter, high_ts, start_time, ret = std::move(ret)](db_clock::time_point ts) mutable {
+        return _sdks.cdc_current_generation_timestamp({ normal_token_owners }).then([this, iter, high_ts, start_time, ret = std::move(ret), schema = std::move(schema)](db_clock::time_point ts) mutable {
             auto& shard = iter.shard;            
 
             if (shard.time < ts && ts < high_ts) {
@@ -1043,7 +1042,11 @@ future<executor::request_return_type> executor::get_records(client_state& client
                 shard_iterator next_iter(iter.table, iter.shard, utils::UUID_gen::min_time_UUID(high_ts.time_since_epoch()), true);
                 rjson::add(ret, "NextShardIterator", iter);
             }
-            _stats.api_operations.get_records_latency.add(std::chrono::steady_clock::now() - start_time);
+            auto defer = seastar::defer([&] {
+                auto latency = std::chrono::steady_clock::now() - start_time;
+                _stats.api_operations.get_records_latency.add(latency);
+                trace_table_access(table_ops_type::GetRecords, schema->ks_name(), latency);
+            });
             if (is_big(ret)) {
                 return make_ready_future<executor::request_return_type>(make_streamed(std::move(ret)));
             }

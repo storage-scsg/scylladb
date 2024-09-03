@@ -9,14 +9,15 @@
 #include "stats.hh"
 #include "utils/histogram_metrics_helper.hh"
 #include <seastar/core/metrics.hh>
+#include "utils/magic_enum.hh"
 
 namespace alternator {
 
 const char* ALTERNATOR_METRICS = "alternator";
+seastar::metrics::label op("op");
 
 stats::stats() : api_operations{} {
     // Register the
-    seastar::metrics::label op("op");
 
     _metrics.add_group("alternator", {
 #define OPERATION(name, CamelCaseName) \
@@ -95,5 +96,31 @@ stats::stats() : api_operations{} {
     });
 }
 
+void stats::add_table_access(const std::string& table_name) {
+    auto table_ops = magic_enum::enum_entries<table_ops_type>();
+    std::vector<seastar::metrics::metric_definition> table_metrics;
+    seastar::metrics::label tab("table_name");
+
+    for (const auto& [op_type, op_string] : table_ops) {
+        // 初始化，初值为 0
+        _table_access[table_name].op_count[static_cast<size_t>(op_type)] = 0;
+        table_metrics.emplace_back(seastar::metrics::make_total_operations(
+            "count",
+            _table_access[table_name].op_count[static_cast<size_t>(op_type)],
+            seastar::metrics::description("stats of table_name operator"),
+            {tab(table_name), op(op_string)}).aggregate({seastar::metrics::shard_label})
+        );
+
+        table_metrics.emplace_back(seastar::metrics::make_histogram(
+            "latency",
+            seastar::metrics::description("stats of TableName latency"),
+            {tab(table_name), op(op_string)},
+            [this, table_name = table_name, op_type = op_type] {
+                return to_metrics_histogram(_table_access[table_name].op_latency[static_cast<size_t>(op_type)]);
+            }).aggregate({seastar::metrics::shard_label})
+        );
+    }
+    _metrics.add_group("alternator_table_op", table_metrics);
+}
 
 }

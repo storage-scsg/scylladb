@@ -171,6 +171,11 @@ public:
     using client_state = service::client_state;
     using request_return_type = std::variant<json::json_return_type, api_error>;
     stats _stats;
+    void trace_table_access(
+        table_ops_type op, 
+        const std::string& table_name, 
+        const std::chrono::steady_clock::duration& latency = std::chrono::steady_clock::duration::zero()
+    );
     static constexpr auto ATTRS_COLUMN_NAME = ":attrs";
     static constexpr auto KEYSPACE_NAME_PREFIX = "alternator_";
     static constexpr std::string_view INTERNAL_TABLE_PREFIX = ".scylla.alternator.";

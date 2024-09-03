@@ -67,6 +67,7 @@ static const sstring TTL_TAG_KEY("system:ttl_attribute");
 
 future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
     _stats.api_operations.update_time_to_live++;
+    auto start_time = std::chrono::steady_clock::now();
     if (!_proxy.data_dictionary().features().alternator_ttl) {
         co_return api_error::unknown_operation("UpdateTimeToLive not yet supported. Experimental support is available if the 'alternator-ttl' experimental feature is enabled on all nodes.");
     }
@@ -111,6 +112,9 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
             }
             tags_map.erase(TTL_TAG_KEY);
         }
+        auto defer = seastar::defer([&] {
+            trace_table_access(table_ops_type::UpdateTimeToLive, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        });
     });
 
     // Prepare the response, which contains a TimeToLiveSpecification
@@ -122,6 +126,7 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
 
 future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
     _stats.api_operations.describe_time_to_live++;
+    auto start_time = std::chrono::steady_clock::now();
     schema_ptr schema = get_table(_proxy, request);
     std::map<sstring, sstring> tags_map = get_tags_of_table_or_throw(schema);
     rjson::value desc = rjson::empty_object();
@@ -134,6 +139,9 @@ future<executor::request_return_type> executor::describe_time_to_live(client_sta
     }
     rjson::value response = rjson::empty_object();
     rjson::add(response, "TimeToLiveDescription", std::move(desc));
+    auto defer = seastar::defer([&] {
+        trace_table_access(table_ops_type::DescribeTimeToLive, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+    });
     co_return make_jsonable(std::move(response));
 }
 
