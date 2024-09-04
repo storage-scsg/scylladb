@@ -912,6 +912,48 @@ static void validate_attribute_definitions(const rjson::value& attribute_definit
         }
     }
 }
+        
+static bool is_deletion_protection_enabled(const rjson::value& request)
+{
+    const rjson::value* deletion_protection_enabled = rjson::find(request, "DeletionProtectionEnabled");
+    // DeletionProtectionEnabled default is disabled
+    if (!deletion_protection_enabled) {
+        return false;
+    }
+
+    if (!deletion_protection_enabled->IsBool()) {
+        throw api_error::validation("DeletionProtectionEnabled needs boolean type");
+    }
+
+    return deletion_protection_enabled->GetBool();
+}
+
+static void update_deletion_protection_attribute(const schema_ptr& schema, const rjson::value& request, std::map<sstring, sstring>& tags_map) {
+    auto deletion_protection_enabled = rjson::find(request, "DeletionProtectionEnabled");
+    // no need to update if not specify 'DeletionProtectionEnabled'
+    if (!deletion_protection_enabled) {
+        return ;
+    }
+
+    if (!deletion_protection_enabled->IsBool()) {
+        throw api_error::validation("DeletionProtectionEnabled needs boolean type");
+    }
+
+    // Read tags of the table, and add or remove DELETION_PROTECTION_TAG_KEY
+    // tag according 'DeletionProtectionEnabled'.
+    const std::map<sstring, sstring>* tags_ptr = db::get_tags_of_table(schema);
+    if (tags_ptr) {
+        tags_map = *tags_ptr;
+    }
+
+    // Put the DELETION_PROTECTION_TAG_KEY in tags means the table is protected.
+    // A table without DELETION_PROTECTION_TAG_KEY means it has not protection.
+    if (deletion_protection_enabled->GetBool()) {
+        tags_map[DELETION_PROTECTION_TAG_KEY] = DELETION_PROTECTION_TAG_VALUE;
+    } else {
+        tags_map.erase(DELETION_PROTECTION_TAG_KEY);
+    }
+}
 
 static future<executor::request_return_type> create_table_on_shard0(tracing::trace_state_ptr trace_state, rjson::value request, service::storage_proxy& sp, service::migration_manager& mm, gms::gossiper& gossiper) {
     assert(this_shard_id() == 0);
@@ -1428,6 +1470,29 @@ mutation put_or_delete_item::build(schema_ptr schema, api::timestamp_type ts) co
 thread_local utils::updateable_value<uint32_t> executor::s_default_timeout_in_ms{10'000};
 db::timeout_clock::time_point executor::default_timeout() {
     return db::timeout_clock::now() + std::chrono::milliseconds(s_default_timeout_in_ms);
+}
+db::timeout_clock::duration executor::s_default_timeout = 10s;
+db::timeout_clock::duration executor::default_getitem_timeout = 3s;
+db::timeout_clock::duration executor::default_putitem_nonlwt_timeout = 2s;
+db::timeout_clock::duration executor::default_putitem_lwt_timeout = 5s;
+db::timeout_clock::duration executor::default_query_timeout = 10s;
+void executor::set_default_timeout(db::timeout_clock::duration timeout) {
+    s_default_timeout = timeout;
+}
+void executor::set_default_getitem_timeout(db::timeout_clock::duration timeout) {
+    default_getitem_timeout = timeout;
+}
+void executor::set_default_putitem_nonlwt_timeout(db::timeout_clock::duration timeout) {
+    default_putitem_nonlwt_timeout = timeout;
+}
+void executor::set_default_putitem_lwt_timeout(db::timeout_clock::duration timeout) {
+    default_putitem_lwt_timeout = timeout;
+}
+void executor::set_default_query_timeout(db::timeout_clock::duration timeout) {
+    default_query_timeout = timeout;
+}
+db::timeout_clock::time_point executor::default_timeout(db::timeout_clock::duration timeout) {
+    return db::timeout_clock::now() + timeout;
 }
         
 static future<std::unique_ptr<rjson::value>> get_previous_item(

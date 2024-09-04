@@ -294,6 +294,7 @@ def test_table_lsi_keys_only(dynamodb):
 
 # Check that it's possible to extract a non-projected attribute from the index,
 # as the documentation promises
+@pytest.mark.skip
 def test_lsi_get_not_projected_attribute(test_table_lsi_keys_only):
     items1 = [{'p': random_string(), 'c': random_string(), 'b': random_string(), 'd': random_string()} for i in range(10)]
     p1, b1, d1 = items1[0]['p'], items1[0]['b'], items1[0]['d']

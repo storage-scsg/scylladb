@@ -339,11 +339,8 @@ struct table_stats {
     int64_t live_disk_space_used = 0;
     int64_t total_disk_space_used = 0;
     int64_t live_sstable_count = 0;
-<<<<<<< HEAD
-=======
     int64_t estimated_row_count = 0;
     int64_t estimated_tombstone_count = 0;
->>>>>>> c8594115b8 (feat: support for counting tombstone for table)
     /** Estimated number of compactions pending for this column family */
     int64_t pending_compactions = 0;
     int64_t memtable_partition_insertions = 0;

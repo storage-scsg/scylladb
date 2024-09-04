@@ -1889,6 +1889,7 @@ future<> system_keyspace::make(
         co_await db.create_local_system_table(table, maybe_write_in_user_memory(table), erm_factory);
         co_await db.find_column_family(table).init_storage();
     }
+    s_repair_histroy_ttl_seconds = db.get_config().repair_histroy_ttl_seconds();
 }
 
 void system_keyspace::mark_writable() {

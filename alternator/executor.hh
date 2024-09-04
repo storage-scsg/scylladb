@@ -216,6 +216,29 @@ public:
 
     static sstring table_name(const schema&);
     static db::timeout_clock::time_point default_timeout();
+    static db::timeout_clock::time_point default_timeout(db::timeout_clock::duration timeout);
+    static void set_default_timeout(db::timeout_clock::duration timeout);
+    static void set_default_getitem_timeout(db::timeout_clock::duration timeout);
+    static void set_default_putitem_nonlwt_timeout(db::timeout_clock::duration timeout);
+    static void set_default_putitem_lwt_timeout(db::timeout_clock::duration timeout);
+    static void set_default_query_timeout(db::timeout_clock::duration timeout);
+    static void set_default_write_consistency_level(std::string_view cl);
+    static void set_default_read_consistency_level(std::string_view cl);
+    static void set_default_getrecords_consistency_level(std::string_view cl);
+    static void set_default_query_consistency_level(std::string_view cl);
+    static void set_alternator_replication_factor(int rf);
+    static db::consistency_level default_write_consistency_level;
+    static db::consistency_level default_write_consistency_level_lwt;
+    static db::consistency_level default_read_consistency_level;
+    static db::consistency_level default_getrecords_consistency_level;
+    static db::consistency_level default_query_consistency_level;
+
+    static db::timeout_clock::duration s_default_timeout;
+    static db::timeout_clock::duration default_getitem_timeout;
+    static db::timeout_clock::duration default_putitem_nonlwt_timeout;
+    static db::timeout_clock::duration default_putitem_lwt_timeout;
+    static db::timeout_clock::duration default_query_timeout;
+    static int alternator_replication_factor;
 private:
     static thread_local utils::updateable_value<uint32_t> s_default_timeout_in_ms;
 public:
