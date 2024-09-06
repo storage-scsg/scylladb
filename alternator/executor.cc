@@ -4733,9 +4733,11 @@ void replace_shard_id_to_zero_handler(rjson::value& data) {
     data.SetString(std::move(str), the_allocator);
 }
 
-// TODO
 bool list_pattern_filter_handler(const rjson::value& data) {
-    return false;
+    // for multiversion bucket metadata list
+    std::regex pattern("^.*\\\\u0000v\\d+\\\\u0000.*");
+
+    return std::regex_match(fmt::format("{}", data), pattern) ? false : true;
 }
 
 const std::unordered_map<service::storage_proxy::synctable_column_alter_method, std::function<void(rjson::value&)>> alter_method_map = {
