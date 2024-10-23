@@ -1045,8 +1045,37 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             }
             std::string vname(view_name(table_name, index_name));
             elogger.trace("Adding GSI {}", index_name);
-            // FIXME: read and handle "Projection" parameter. This will
-            // require the MV code to copy just parts of the attrs map.
+            std::vector<sstring> include_columns;
+            const rjson::value* projection = rjson::find(g, "Projection");
+            if (projection) {
+                const rjson::value* projection_type = rjson::find(*projection, "ProjectionType");
+                if (!projection_type || !projection_type->IsString()) {
+                    co_return api_error::validation(format("GlobalSecondaryIndexes ProjectionType must be a string. Instead of {}.",*projection));
+                }
+                sstring pt = projection_type->GetString();
+                if (!legal_projection_type.contains(pt)) {
+                    co_return api_error::validation(format("GlobalSecondaryIndexes ProjectionType must be one of 'KEYS_ONLY', 'INCLUDE', 'ALL'. Instead of {}", pt));
+                }
+                if (pt == "INCLUDE") {
+                    const rjson::value* nonkeyattributes = rjson::find(*projection, "NonKeyAttributes");
+                    if (!nonkeyattributes) {
+                        co_return api_error::validation(format("If Projection type INCLUDE is specified, some non-key attributes to include in the projection must be specified as well"));
+                    }
+                    if (!nonkeyattributes->IsArray()) {
+                        co_return api_error::validation(format("GlobalSecondaryIndexes NonKeyAttributes must be an array. Instead of {}.",*nonkeyattributes));
+                    }
+                    for (const rjson::value& nka : nonkeyattributes->GetArray()) {
+                        include_columns.push_back(std::move(nka.GetString()));
+                    }
+                } else if (rjson::find(*projection, "NonKeyAttributes")) {
+                    // If protection type is not INCLUDE, there should not specify the NonKeyAttributes, in case of improper reflection of indexes 
+                    co_return api_error::validation(format("No attributes should be specified to be projected unless projection type is INCLUDE."));
+                }
+                projection_types.push_back(std::move(pt));
+            } else {
+                projection_types.push_back("ALL");
+            }
+
             schema_builder view_builder(keyspace_name, vname);
             auto [view_hash_key, view_range_key] = parse_key_schema(g);
             if (partial_schema->get_column_definition(to_bytes(view_hash_key)) == nullptr) {
@@ -1107,8 +1136,35 @@ static future<executor::request_return_type> create_table_on_shard0(tracing::tra
             if (range_key.empty()) {
                 co_return api_error::validation("LocalSecondaryIndex requires that the base table have a range key");
             }
-            // FIXME: read and handle "Projection" parameter. This will
-            // require the MV code to copy just parts of the attrs map.
+            // Read and handle "Projection" parameter.
+            std::vector<sstring> include_columns;
+            const rjson::value* projection = rjson::find(l, "Projection");
+            if (projection) {
+                const rjson::value* projection_type = rjson::find(*projection, "ProjectionType");
+                if (!projection_type || !projection_type->IsString()) {
+                    co_return api_error::validation(format("LocalSecondaryIndexes ProjectionType must be a string. Instead of {}.",*projection));
+                }
+                sstring pt = projection_type->GetString();
+                if (!legal_projection_type.contains(pt)) {
+                    co_return api_error::validation(format("LocalSecondaryIndexes ProjectionType must be one of 'KEYS_ONLY', 'INCLUDE', 'ALL'. Instead of {}", pt));
+                }
+                if (pt == "INCLUDE") {
+                    const rjson::value* nonkeyattributes = rjson::find(*projection, "NonKeyAttributes");
+                    if (!nonkeyattributes || !nonkeyattributes->IsArray()) {
+                        co_return api_error::validation(format("LocalSecondaryIndexes NonKeyAttributes must be an array. Instead of {}.",*nonkeyattributes));
+                    }
+                    for (const rjson::value& nka : nonkeyattributes->GetArray()) {
+                        include_columns.push_back(std::move(nka.GetString()));
+                    }
+                } else if (rjson::find(*projection, "NonKeyAttributes")) {
+                    // If protection type is not INCLUDE, there should not specify the NonKeyAttributes, in case of improper reflection of indexes 
+                    co_return api_error::validation(format("No attributes should be specified to be projected unless projection type is INCLUDE."));
+                }
+                projection_types.push_back(std::move(pt));
+            } else {
+                projection_types.push_back("ALL");
+            }
+
             schema_builder view_builder(keyspace_name, vname);
             auto [view_hash_key, view_range_key] = parse_key_schema(l);
             if (view_hash_key != hash_key) {
