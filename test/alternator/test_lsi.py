@@ -572,3 +572,33 @@ def test_lsi_name_rest_api(test_table_lsi_1, rest_api):
     encoded_lsi_rest_name = requests.utils.quote(lsi_rest_name)
     resp = requests.get(f'{rest_api}/column_family/compaction_strategy/{encoded_lsi_rest_name}')
     resp.raise_for_status()
+
+def test_projection_type_expression(dynamodb):
+    with pytest.raises(ClientError, match=r'ValidationException.*No attributes should be specified to be projected unless projection type is INCLUDE'):
+        # 尝试创建表，包含 NonKeyAttributes 以触发异常
+        create_test_table(
+            dynamodb,
+            KeySchema=[
+                {'AttributeName': 'ms_pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'ms_sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'ms_pk', 'AttributeType': 'S'},
+                {'AttributeName': 'ms_sk', 'AttributeType': 'S'},
+                {'AttributeName': 'obj_id', 'AttributeType': 'S'},
+                {'AttributeName': 'missing_size', 'AttributeType': 'N'}
+            ],
+            LocalSecondaryIndexes=[
+                {
+                    'IndexName': 'missing_slice_v1_lsi',
+                    'KeySchema': [
+                        {'AttributeName': 'ms_pk', 'KeyType': 'HASH'},
+                        {'AttributeName': 'missing_size', 'KeyType': 'RANGE'}
+                    ],
+                    'Projection': {
+                        'ProjectionType': 'ALL',
+                        'NonKeyAttributes': ['val']
+                    }
+                }
+            ]
+        )

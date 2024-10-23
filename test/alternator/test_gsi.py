@@ -1593,3 +1593,44 @@ def test_17119a(test_table_gsi_2):
     assert_index_query(test_table_gsi_2, 'hello', [item],
         KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
                        'x': {'AttributeValueList': [x], 'ComparisonOperator': 'EQ'}})
+
+def test_projection_type_expression_with_gsi(dynamodb):
+    # 尝试创建表，包含 NonKeyAttributes 以触发异常
+    with pytest.raises(ClientError, match=r'ValidationException.*No attributes should be specified to be projected unless projection type is INCLUDE'):
+        create_test_table(
+            dynamodb,
+            KeySchema=[
+                {'AttributeName': 'ms_pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'ms_sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'ms_pk', 'AttributeType': 'S'},
+                {'AttributeName': 'ms_sk', 'AttributeType': 'S'},
+                {'AttributeName': 'obj_id', 'AttributeType': 'S'},
+                {'AttributeName': 'missing_size', 'AttributeType': 'N'}
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    'IndexName': 'missing_slice_v1_index',
+                    'KeySchema': [
+                        {'AttributeName': 'ms_pk', 'KeyType': 'HASH'},
+                        {'AttributeName': 'missing_size', 'KeyType': 'RANGE'}
+                    ],
+                    'Projection': {
+                        'ProjectionType': 'ALL',
+                        'NonKeyAttributes': ['val']
+                    }
+                },
+                {
+                    'IndexName': 'missing_slice_v1_id',
+                    'KeySchema': [
+                        {'AttributeName': 'ms_pk', 'KeyType': 'HASH'},
+                        {'AttributeName': 'obj_id', 'KeyType': 'RANGE'}
+                    ],
+                    'Projection': {
+                        'ProjectionType': 'ALL',
+                        'NonKeyAttributes': ['val']
+                    }
+                }
+            ]
+        )
