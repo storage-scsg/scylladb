@@ -1368,6 +1368,10 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
             cfg.expected_transport_latency = expected_transport_latency;
         }
 
+        if (_sp.local()._synctable_repair_config_map.size() == 1) {
+            throw std::runtime_error("only one synctable repair is allowed at the same time.");
+        }
+
         co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
             return sp.insert_synctable_repair_cfg(repair_uuid, cfg);
         });
