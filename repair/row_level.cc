@@ -240,7 +240,11 @@ struct row_level_repair_metrics {
 
     void calculate_srps() {
         auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - synced_row_nr_meta.start_time).count();
-        synced_row_nr_meta.synced_row_nr_per_sec = (uint64_t)(float(synced_row_nr_meta.total_row_nr) / duration);
+        if (duration <= 0.0f) {
+            synced_row_nr_meta.synced_row_nr_per_sec = std::numeric_limits<uint64_t>::max();
+        } else {
+            synced_row_nr_meta.synced_row_nr_per_sec = (uint64_t)(float(synced_row_nr_meta.total_row_nr) / duration);
+        }
         return;
     }
 
@@ -2505,6 +2509,7 @@ private:
 
 public:
     future<> synctable_in_repair(bool use_working_row_buf) {
+        rlogger.debug("repair[{}]: synctable_in_repair start with use_working_row_buf {}.", _repair_task_id, use_working_row_buf);
         if (_synctable_flag.has_value()) {
             if (!_synctable_flag.value()) {
                 co_return co_await make_ready_future<>();

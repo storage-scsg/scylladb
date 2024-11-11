@@ -839,7 +839,7 @@ struct repair_options {
     int batch_row_limit = 0;
     bool read_before_write = false;
     int max_connections = 0;
-    uint64_t peer_ops = 0;
+    uint32_t peer_ops = 0;
     bool incremental = false;
 
     repair_options(std::unordered_map<sstring, sstring> options) {
@@ -861,7 +861,7 @@ struct repair_options {
         int_opt(batch_row_limit, options, BATCH_ROW_LIMIT_INT_KEY);
         bool_opt(read_before_write, options, READ_BEFORE_WRITE_BOOL_KEY);
         int_opt(max_connections, options, MAX_CONNECTIONS_INT_KEY);
-        ullint_opt(peer_ops, options, PEER_OPS_ULLINT_KEY);
+        ulint_opt(peer_ops, options, PEER_OPS_ULLINT_KEY);
         // We currently do not support incremental repair. We could probably
         // ignore this option as it is just an optimization, but for now,
         // let's make it an error.
@@ -954,6 +954,20 @@ private:
             var = strtol(it->second.c_str(), nullptr, 10);
             if (errno) {
                 throw(std::runtime_error(format("cannot parse integer: '{}'", it->second)));
+            }
+            options.erase(it);
+        }
+    }
+
+    static void ulint_opt(uint32_t& var,
+            std::unordered_map<sstring, sstring>& options,
+            const sstring& key) {
+        auto it = options.find(key);
+        if (it != options.end()) {
+            errno = 0;
+            var = strtoul(it->second.c_str(), nullptr, 10);
+            if (errno) {
+                throw(std::runtime_error(format("cannot parse unsigned long integer: '{}'", it->second)));
             }
             options.erase(it);
         }
@@ -1155,17 +1169,18 @@ static bool match_alternator_keyspace_basetable_name(const sstring& keyspace, co
 // expected_srps = ops / shard_num
 // limit * batch_num * round_num = expected_srps ----> round_num = expected_srps / (limit * batch_num) ----> round_num = (ops / shard_num) / (limit * batch_num)
 // expected_round_milliseconds * round_num = 1000ms ----> expected_round_milliseconds = (1000ms) / round_num
-static std::tuple<uint32_t, uint32_t> get_concurr_limit_and_round_millis(uint32_t batch_num, uint64_t ops) {
+static std::tuple<uint32_t, uint32_t> get_concurr_limit_and_round_millis(uint32_t batch_num, uint32_t ops) {
+    rlogger.debug("repair[get_concurr_limit_and_round_millis]: batch_num {}, ops {}", batch_num, ops);
     // the batch_put latency for e3 is approximately half of the batch_put_num.
-    uint32_t average_batch_put_latency_millis = batch_num / 2;
+    uint32_t average_batch_put_latency_millis = (uint32_t)(std::ceil((float)batch_num / (float)2));
     // the estimated thread_round per second should not be greater than 30 (1000ms / 35ms ≈ 30), otherwise the limit
     // will be 1 for most of the time.
-    uint32_t thread_round_per_sec = std::min((uint32_t)1000 / average_batch_put_latency_millis, (uint32_t)30);
+    uint32_t thread_round_per_sec = std::min((uint32_t)(std::ceil((float)1000 / (float)average_batch_put_latency_millis)), (uint32_t)30);
     uint32_t shard_num = smp::count;
-    uint32_t limit = (uint32_t)(std::ceil((double)ops / (double)(shard_num * batch_num * thread_round_per_sec)));
+    uint32_t limit = (uint32_t)(std::ceil((float)ops / (float)(shard_num * batch_num * thread_round_per_sec)));
 
-    uint64_t round_num = (ops / (uint64_t)shard_num) / (limit * (uint64_t)batch_num);
-    uint64_t expected_round_milliseconds = (uint64_t)1000 / round_num;
+    uint32_t round_num = (uint32_t)(std::ceil(((float)ops / (float)shard_num) / (float)(limit * batch_num)));
+    uint32_t expected_round_milliseconds = (uint32_t)1000 / round_num;
 
     return {limit, expected_round_milliseconds};
 }
@@ -1353,12 +1368,11 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
             cfg.expected_transport_latency = expected_transport_latency;
         }
 
-        rlogger.debug("repair[{}]: config http_conn_resource as {} and expected_transport_latency as {}ms.", id.uuid(), cfg.http_conn_resource, cfg.expected_transport_latency);
-
         co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
             return sp.insert_synctable_repair_cfg(repair_uuid, cfg);
         });
-        rlogger.info("repair[{}]: config inserted successfully, ready to sync table during repair.", id.uuid());
+        rlogger.info("repair[{}]: config inserted successfully, ready to sync table during repair with http_conn_resource as {} and expected_transport_latency as {}ms.",
+            id.uuid(), cfg.http_conn_resource, cfg.expected_transport_latency);
     }
 
     // If the "ranges" option is not explicitly specified, we repair all the
