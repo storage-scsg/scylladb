@@ -113,7 +113,7 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
             tags_map.erase(TTL_TAG_KEY);
         }
         auto defer = seastar::defer([&] {
-            trace_table_access(table_ops_type::UpdateTimeToLive, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+            trace_table_access(table_ops_type::UpdateTimeToLive, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
         });
     });
 
@@ -140,7 +140,7 @@ future<executor::request_return_type> executor::describe_time_to_live(client_sta
     rjson::value response = rjson::empty_object();
     rjson::add(response, "TimeToLiveDescription", std::move(desc));
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::DescribeTimeToLive, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::DescribeTimeToLive, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     co_return make_jsonable(std::move(response));
 }

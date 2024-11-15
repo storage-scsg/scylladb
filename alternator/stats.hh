@@ -55,8 +55,9 @@ public:
         std::array<utils::time_estimated_histogram, table_ops_type_num> op_latency;
     };
 
-    std::unordered_map<std::string, table_stats> _table_access;
-    void add_table_access(const std::string& table_name);
+    // table -> <user, stats>
+    std::unordered_map<std::string, std::unordered_map<std::string, table_stats>> _table_access;
+    void add_table_access(const std::string& table_name, const std::string& user_name);
     // Count of DynamoDB API operations by types
     struct {
         uint64_t batch_get_item = 0;

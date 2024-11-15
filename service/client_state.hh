@@ -214,6 +214,10 @@ public:
         , _sl_controller(&sl_controller)
     {}
 
+    client_state(internal_tag, sstring username) : client_state(internal_tag{}, infinite_timeout_config) {
+         _user = auth::authenticated_user(username);
+    }
+
     client_state(const client_state&) = delete;
     client_state(client_state&&) = default;
 

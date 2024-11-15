@@ -36,25 +36,6 @@ namespace alternator {
 
 static constexpr auto TARGET = "X-Amz-Target";
 
-inline std::vector<std::string_view> split(std::string_view text, char separator) {
-    std::vector<std::string_view> tokens;
-    if (text == "") {
-        return tokens;
-    }
-
-    while (true) {
-        auto pos = text.find_first_of(separator);
-        if (pos != std::string_view::npos) {
-            tokens.emplace_back(text.data(), pos);
-            text.remove_prefix(pos + 1);
-        } else {
-            tokens.emplace_back(text);
-            break;
-        }
-    }
-    return tokens;
-}
-
 // Handle CORS (Cross-origin resource sharing) in the HTTP request:
 // If the request has the "Origin" header specifying where the script which
 // makes this request comes from, we need to reply with the header
@@ -206,6 +187,61 @@ protected:
     }
 };
 
+class add_or_delete_user_list_handle : public gated_handler {
+public:
+    add_or_delete_user_list_handle(seastar::gate& pending_requests) : gated_handler(pending_requests) {}
+protected:
+    virtual future<std::unique_ptr<reply>> do_handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, false);
+        rjson::value results = rjson::empty_object();
+
+        sstring operation = req->get_query_param("operation");
+        sstring users = req->get_query_param("users");
+
+        if (operation != "add" && operation != "remove") {
+            rep->set_status(reply::status_type::bad_request);
+            rjson::add(results, "message", "Invalid operation.");
+            rep->_content = rjson::print(std::move(results));
+            return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        }
+        return smp::invoke_on_all([operation, users] {
+            auto users_set = split(std::string_view(users), ',');
+            for (auto& user : users_set) {
+                if (operation == "remove") {
+                    executor::s_user_list.erase(sstring(user));
+                } else {
+                    executor::s_user_list.insert(sstring(user));
+                }
+            }
+        }).then([rep = std::move(rep)]() mutable {
+            rep->set_status(reply::status_type::ok);
+            rep->write_body("txt", sstring(""));
+            return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        });
+    }
+};
+
+class get_user_list_handle : public gated_handler {
+public:
+    get_user_list_handle(seastar::gate& pending_requests) : gated_handler(pending_requests) {}
+protected:
+    virtual future<std::unique_ptr<reply>> do_handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, false);
+        rep->set_status(reply::status_type::ok);
+        rjson::value results = rjson::empty_object();
+
+        sstring users;
+        for (auto& user : executor::s_user_list) {
+            users += user + ",";
+        }
+
+        rjson::add(results, "Users", rjson::from_string(users));
+        rep->set_content_type("json");
+        rep->_content = rjson::print(std::move(results));
+        return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+    }
+};
+
 class local_nodelist_handler : public gated_handler {
     service::storage_proxy& _proxy;
     gms::gossiper& _gossiper;
@@ -255,10 +291,6 @@ protected:
 };
 
 future<std::string> server::verify_signature(const request& req, const chunked_content& content) {
-    if (!_enforce_authorization) {
-        slogger.debug("Skipping authorization");
-        return make_ready_future<std::string>();
-    }
     auto host_it = req._headers.find("Host");
     if (host_it == req._headers.end()) {
         throw api_error::invalid_signature("Host header is mandatory for signature verification");
@@ -312,6 +344,15 @@ future<std::string> server::verify_signature(const request& req, const chunked_c
     std::string datestamp(credential_split[1]);
     std::string region(credential_split[2]);
     std::string service(credential_split[3]);
+
+    if (user.empty()) {
+        throw api_error::invalid_signature("User cannot be empty");
+    }
+
+    if (!_enforce_authorization) {
+        slogger.debug("Skipping authorization with user {}", user);
+        return make_ready_future<std::string>(user);
+    }
 
     std::map<std::string_view, std::string_view> signed_headers_map;
     for (const auto& header : signed_headers) {
@@ -437,9 +478,9 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     auto leave = defer([this] () noexcept { _pending_requests.leave(); });
     //FIXME: Client state can provide more context, e.g. client's endpoint address
     // We use unique_ptr because client_state cannot be moved or copied
-    executor::client_state client_state = username.empty()
-        ? service::client_state{service::client_state::internal_tag()}
-        : service::client_state{service::client_state::internal_tag(), _auth_service, _sl_controller, username};
+    executor::client_state client_state = _enforce_authorization
+        ? service::client_state{service::client_state::internal_tag(), _auth_service, _sl_controller, username}
+        : service::client_state{service::client_state::internal_tag(), username};
     co_await client_state.maybe_update_per_service_level_params();
 
     tracing::trace_state_ptr trace_state = maybe_trace_query(client_state, username, op, content);
@@ -470,6 +511,8 @@ void server::set_routes(routes& r) {
     // or even just scan for open ports.
     r.put(operation_type::GET, "/localnodes", new local_nodelist_handler(_pending_requests, _proxy, _gossiper));
     r.put(operation_type::OPTIONS, "/", new options_handler(_pending_requests));
+    r.put(operation_type::GET, "/user_list", new get_user_list_handle(_pending_requests));
+    r.put(operation_type::POST, "/user_list", new add_or_delete_user_list_handle(_pending_requests));
 }
 
 //FIXME: A way to immediately invalidate the cache should be considered,

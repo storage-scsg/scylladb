@@ -442,20 +442,27 @@ static rjson::value generate_arn_for_index(const schema& schema, std::string_vie
         schema.ks_name(), schema.cf_name(), index_name));
 }
 
+thread_local std::set<sstring> executor::s_user_list{};
+
 void executor::trace_table_access(
-    table_ops_type op, 
-    const std::string& table_name, 
-    const std::chrono::steady_clock::duration& latency
-) {
+        table_ops_type op,
+        const std::string& table_name,
+        std::string user_name,
+        const std::chrono::steady_clock::duration& latency) {
     if (table_name.empty()) {
         return;
     }
-    if (!_stats._table_access.contains(table_name)) {
-        _stats.add_table_access(table_name);
+
+    if (!s_user_list.contains(user_name)) {
+        user_name = "unknown";
     }
 
-    _stats._table_access[table_name].op_count[static_cast<size_t>(op)]++;
-    _stats._table_access[table_name].op_latency[static_cast<size_t>(op)].add(latency);
+    if (!_stats._table_access.contains(table_name) || !_stats._table_access[table_name].contains(user_name)) {
+        _stats.add_table_access(table_name, user_name);
+    }
+
+    _stats._table_access[table_name][user_name].op_count[static_cast<size_t>(op)]++;
+    _stats._table_access[table_name][user_name].op_latency[static_cast<size_t>(op)].add(latency);
 }
 
 static rjson::value fill_table_description(schema_ptr schema, table_status tbl_status, service::storage_proxy const& proxy)
@@ -562,7 +569,7 @@ future<executor::request_return_type> executor::describe_table(client_state& cli
     rjson::add(response, "Table", std::move(table_description));
     elogger.trace("returning {}", response);
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::DescribeTable, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::DescribeTable, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     return make_ready_future<executor::request_return_type>(make_jsonable(std::move(response)));
 }
@@ -605,7 +612,7 @@ future<executor::request_return_type> executor::delete_table(client_state& clien
     rjson::add(response, "TableDescription", std::move(table_description));
     elogger.trace("returning {}", response);
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::DeleteTable, keyspace_name, std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::DeleteTable, keyspace_name, client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     co_return make_jsonable(std::move(response));
 }
@@ -844,7 +851,7 @@ future<executor::request_return_type> executor::tag_resource(client_state& clien
         update_tags_map(*tags, tags_map, update_tags_action::add_tags);
     });
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::TagResource, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::TagResource, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     co_return json_string("");
 }
@@ -868,7 +875,7 @@ future<executor::request_return_type> executor::untag_resource(client_state& cli
         update_tags_map(*tags, tags_map, update_tags_action::delete_tags);
     });
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::UntagResource, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::UntagResource, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     co_return json_string("");
 }
@@ -894,7 +901,7 @@ future<executor::request_return_type> executor::list_tags_of_resource(client_sta
         rjson::push_back(tags, std::move(new_entry));
     }
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::ListTagsOfResource, schema->ks_name(), std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::ListTagsOfResource, schema->ks_name(), client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
 
     return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
@@ -1291,7 +1298,7 @@ future<executor::request_return_type> executor::create_table(client_state& clien
     elogger.trace("Creating table {}", request);
     auto table_name = sstring(executor::KEYSPACE_NAME_PREFIX) + get_table_name(request);
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::CreateTable, table_name, std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::CreateTable, table_name, client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
 
     co_return co_await _mm.container().invoke_on(0, [&, tr = tracing::global_trace_state_ptr(trace_state), request = std::move(request), &sp = _proxy.container(), &g = _gossiper.container()]
@@ -1322,7 +1329,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         verify_billing_mode(request);
     }
 
-    co_return co_await _mm.container().invoke_on(0, [this, &p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), start_time]
+    co_return co_await _mm.container().invoke_on(0, [this, &p = _proxy.container(), request = std::move(request), gt = tracing::global_trace_state_ptr(std::move(trace_state)), start_time, user_name = client_state.user()->name.value()]
                                                 (service::migration_manager& mm) mutable -> future<executor::request_return_type> {
         // FIXME: the following needs to be in a loop. If mm.announce() below
         // fails, we need to retry the whole thing.
@@ -1357,7 +1364,7 @@ future<executor::request_return_type> executor::update_table(client_state& clien
         supplement_table_info(request, *schema, p.local());
         rjson::add(status, "TableDescription", std::move(request));
         auto defer = seastar::defer([&] {
-            trace_table_access(table_ops_type::UpdateTable, tab->ks_name(), std::chrono::steady_clock::now() - start_time);
+            trace_table_access(table_ops_type::UpdateTable, tab->ks_name(), user_name, std::chrono::steady_clock::now() - start_time);
         });
         co_return make_jsonable(std::move(status));
     });
@@ -1922,11 +1929,12 @@ future<executor::request_return_type> executor::put_item(client_state& client_st
             });
         });
     }
-    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally([op, start_time, this] {
+    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally(
+        [op, start_time, this, user_name = client_state.user()->name.value()] {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.put_item_latency.add(latency);
-            trace_table_access(table_ops_type::PutItem, op->schema()->ks_name(), latency);
+            trace_table_access(table_ops_type::PutItem, op->schema()->ks_name(), user_name, latency);
         });
     });
 }
@@ -2011,11 +2019,12 @@ future<executor::request_return_type> executor::delete_item(client_state& client
             });
         });
     }
-    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally([op, start_time, this] {
+    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally(
+        [op, start_time, this, user_name = client_state.user()->name.value()] {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.delete_item_latency.add(latency);
-            trace_table_access(table_ops_type::DeleteItem, op->schema()->ks_name(), latency);
+            trace_table_access(table_ops_type::DeleteItem, op->schema()->ks_name(), user_name, latency);
         });
     });
 }
@@ -2223,7 +2232,8 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
         }
     }
 
-    return do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats).then([this, start_time, batch_write_op_table_name = std::move(batch_write_op_table_name)] () {
+    return do_batch_write(_proxy, _ssg, std::move(mutation_builders), client_state, trace_state, std::move(permit), _stats).then(
+        [this, start_time, batch_write_op_table_name = std::move(batch_write_op_table_name), user_name = client_state.user()->name.value()] () {
         // FIXME: Issue #5650: If we failed writing some of the updates,
         // need to return a list of these failed updates in UnprocessedItems
         // rather than fail the whole write (issue #5650).
@@ -2234,7 +2244,7 @@ future<executor::request_return_type> executor::batch_write_item(client_state& c
         _stats.api_operations.batch_write_item_latency.add(latency);
         for (const auto& table_name : batch_write_op_table_name) {
             auto defer = seastar::defer([&] {
-                trace_table_access(table_ops_type::BatchWriteItem, table_name, latency);
+                trace_table_access(table_ops_type::BatchWriteItem, table_name, user_name, latency);
             });
         }
         return make_ready_future<executor::request_return_type>(make_jsonable(std::move(ret)));
@@ -3290,11 +3300,12 @@ future<executor::request_return_type> executor::update_item(client_state& client
             });
         });
     }
-    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally([op, start_time, this] {
+    return op->execute(_proxy, client_state, trace_state, std::move(permit), needs_read_before_write, _stats).finally(
+        [op, start_time, this, user_name = client_state.user()->name.value()] {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.update_item_latency.add(latency);
-            trace_table_access(table_ops_type::UpdateItem, op->schema()->ks_name(), latency);
+            trace_table_access(table_ops_type::UpdateItem, op->schema()->ks_name(), user_name, latency);
         });
     });
 }
@@ -3377,12 +3388,12 @@ future<executor::request_return_type> executor::get_item(client_state& client_st
     verify_all_are_used(expression_attribute_names, used_attribute_names, "ExpressionAttributeNames", "GetItem");
 
     return _proxy.query(schema, std::move(command), std::move(partition_ranges), cl,
-            service::storage_proxy::coordinator_query_options(executor::default_timeout(), std::move(permit), client_state, trace_state)).then(
-            [this, schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = std::move(attrs_to_get), start_time = std::move(start_time)] (service::storage_proxy::coordinator_query_result qr) mutable {
+            service::storage_proxy::coordinator_query_options(executor::default_timeout(executor::default_getitem_timeout), std::move(permit), client_state, trace_state)).then(
+            [this, schema, partition_slice = std::move(partition_slice), selection = std::move(selection), attrs_to_get = std::move(attrs_to_get), start_time = std::move(start_time), user_name = client_state.user()->name.value()] (service::storage_proxy::coordinator_query_result qr) mutable {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.get_item_latency.add(latency);
-            trace_table_access(table_ops_type::GetItem, schema->ks_name(), latency);
+            trace_table_access(table_ops_type::GetItem, schema->ks_name(), user_name, latency);
         });
         return make_ready_future<executor::request_return_type>(make_jsonable(describe_item(schema, partition_slice, *selection, *qr.query_result, std::move(attrs_to_get))));
     });
@@ -3594,7 +3605,7 @@ future<executor::request_return_type> executor::batch_get_item(client_state& cli
     _stats.api_operations.batch_get_item_latency.add(latency);
     for (const auto& table_name : batch_get_op_table_name) {
         auto defer = seastar::defer([&] {
-            trace_table_access(table_ops_type::BatchGetItem, table_name, latency);
+            trace_table_access(table_ops_type::BatchGetItem, table_name, client_state.user()->name.value(), latency);
         });
     }
     if (is_big(response)) {
@@ -4078,11 +4089,12 @@ future<executor::request_return_type> executor::scan(client_state& client_state,
     verify_all_are_used(expression_attribute_values, used_attribute_values, "ExpressionAttributeValues", "Scan");
 
     return do_query(_proxy, schema, exclusive_start_key, std::move(partition_ranges), std::move(ck_bounds), std::move(attrs_to_get), limit, cl,
-            std::move(filter), query::partition_slice::option_set(), client_state, _stats.cql_stats, trace_state, std::move(permit)).finally([start_time, schema = std::move(schema), this] {
+            std::move(filter), query::partition_slice::option_set(), client_state, _stats.cql_stats, trace_state, std::move(permit)).finally(
+            [start_time, schema = std::move(schema), this, user_name = client_state.user()->name.value()] {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.scan_latency.add(latency);
-            trace_table_access(table_ops_type::Scan, schema->ks_name(), latency);
+            trace_table_access(table_ops_type::Scan, schema->ks_name(), user_name, latency);
         });
         
     });
@@ -4565,11 +4577,12 @@ future<executor::request_return_type> executor::query(client_state& client_state
     query::partition_slice::option_set opts;
     opts.set_if<query::partition_slice::option::reversed>(!forward);
     return do_query(_proxy, schema, exclusive_start_key, std::move(partition_ranges), std::move(ck_bounds), std::move(attrs_to_get), limit, cl,
-            std::move(filter), opts, client_state, _stats.cql_stats, std::move(trace_state), std::move(permit)).finally([start_time, schema = std::move(schema), this] {
+            std::move(filter), opts, client_state, _stats.cql_stats, std::move(trace_state), std::move(permit)).finally(
+            [start_time, schema = std::move(schema), this, user_name = client_state.user()->name.value()] {
         auto defer = seastar::defer([&] {
             auto latency = std::chrono::steady_clock::now() - start_time;
             _stats.api_operations.query_latency.add(latency);
-            trace_table_access(table_ops_type::Query, schema->ks_name(), latency);
+            trace_table_access(table_ops_type::Query, schema->ks_name(), user_name, latency);
         });
     });
 }
@@ -4692,7 +4705,7 @@ future<executor::request_return_type> executor::describe_continuous_backups(clie
     rjson::value response = rjson::empty_object();
     rjson::add(response, "ContinuousBackupsDescription", std::move(desc));
     auto defer = seastar::defer([&] {
-        trace_table_access(table_ops_type::DescribeContinuousBackups, sstring(executor::KEYSPACE_NAME_PREFIX) + table_name, std::chrono::steady_clock::now() - start_time);
+        trace_table_access(table_ops_type::DescribeContinuousBackups, sstring(executor::KEYSPACE_NAME_PREFIX) + table_name, client_state.user()->name.value(), std::chrono::steady_clock::now() - start_time);
     });
     co_return make_jsonable(std::move(response));
 }

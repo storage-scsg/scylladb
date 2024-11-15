@@ -32,6 +32,8 @@ from botocore.exceptions import ClientError
 from util import random_string, new_test_table, is_aws
 from conftest import filled_test_table, adjust_gc_grace_seconds_of_table
 
+import json
+
 # Fixture for checking if we are able to test Scylla metrics. Scylla metrics
 # are not available on AWS (of course), but may also not be available for
 # Scylla if for some reason we have only access to the Alternator protocol
@@ -331,3 +333,52 @@ def test_estimated_rows_and_tombstones(dynamodb, metrics, rest_api):
         subtract_one_metrics_row_count, subtract_one_metrics_tombstone_count = get_row_and_tombstone_metrics(metrics, rest_api, table)
         assert subtract_one_metrics_row_count[table.name] == 1
         assert subtract_one_metrics_tombstone_count[table.name] == 1
+
+# support user level operation metrics.
+
+def get_users(resp):
+    users = (resp.json())['Users'].split(',')
+    return [user for user in users if user]
+
+def test_alternator_user_list_api(dynamodb):
+    url = dynamodb.meta.client._endpoint.host
+    resp = requests.get(url +'/user_list')
+    users = get_users(resp)
+
+    assert 'user1' in users
+    assert 'user2' in users
+    assert 'user3' in users
+
+    requests.post(url+'/user_list', params={'operation' : 'add', 'users' : 'accesser,alternator'})
+    resp = requests.get(url +'/user_list')
+    users = get_users(resp)
+
+    assert 'accesser' in users
+    assert 'alternator' in users
+
+    requests.post(url+'/user_list', params={'operation' : 'remove', 'users' : 'alternator'})
+    resp = requests.get(url +'/user_list')
+    users = get_users(resp)
+
+    assert 'alternator' not in users
+
+def test_alternator_user_metrics(dynamodb, test_table_s, metrics):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p})
+    the_metrics = get_metrics(metrics)
+    count = get_metric(metrics, 'scylla_alternator_table_op_count', {'op': 'PutItem', 'user_name' : 'unknown'}, the_metrics)
+    assert count != 0
+    count = get_metric(metrics, 'scylla_alternator_table_op_count', {'op': 'PutItem', 'user_name' : 'alternator'}, the_metrics)
+    assert count == 0
+
+    url = dynamodb.meta.client._endpoint.host
+    requests.post(url+'/user_list', params={'operation' : 'add', 'users' : 'alternator'})
+    p = random_string()
+    test_table_s.put_item(Item={'p': p})
+    the_metrics = get_metrics(metrics)
+    count = get_metric(metrics, 'scylla_alternator_table_op_count', {'op': 'PutItem', 'user_name' : 'alternator'}, the_metrics)
+    assert count != 0
+    count = get_metric(metrics, 'scylla_alternator_table_op_latency_bucket', {'op': 'PutItem', 'user_name' : 'alternator'}, the_metrics)
+    assert count == 0
+    count = get_metric(metrics, 'scylla_alternator_table_op_latency_bucket', {'op': 'PutItem'}, the_metrics)
+    assert count != 0

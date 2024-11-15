@@ -83,9 +83,14 @@ future<> controller::start_server() {
         auto get_timeout_in_ms = [] (const db::config& cfg) -> utils::updateable_value<uint32_t> {
             return cfg.alternator_timeout_in_ms;
         };
+
+        std::string alternator_users = _config.alternator_user_list();
+        std::vector<std::string_view> alternator_user_list = split(alternator_users, ',');
+
         _executor.start(std::ref(_gossiper), std::ref(_proxy), std::ref(_mm), std::ref(_sys_dist_ks),
                         sharded_parameter(get_cdc_metadata, std::ref(_cdc_gen_svc)), _ssg.value(),
-                        sharded_parameter(get_timeout_in_ms, std::ref(_config))).get();
+                        sharded_parameter(get_timeout_in_ms, std::ref(_config)),
+                        std::ref(alternator_user_list)).get();
         _server.start(std::ref(_executor), std::ref(_proxy), std::ref(_gossiper), std::ref(_auth_service), std::ref(_sl_controller)).get();
         // Note: from this point on, if start_server() throws for any reason,
         // it must first call stop_server() to stop the executor and server

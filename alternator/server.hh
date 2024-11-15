@@ -22,6 +22,25 @@
 
 namespace alternator {
 
+inline std::vector<std::string_view> split(std::string_view text, char separator) {
+    std::vector<std::string_view> tokens;
+    if (text == "") {
+        return tokens;
+    }
+
+    while (true) {
+        auto pos = text.find_first_of(separator);
+        if (pos != std::string_view::npos) {
+            tokens.emplace_back(text.data(), pos);
+            text.remove_prefix(pos + 1);
+        } else {
+            tokens.emplace_back(text);
+            break;
+        }
+    }
+    return tokens;
+}
+
 using chunked_content = rjson::chunked_content;
 
 class server {

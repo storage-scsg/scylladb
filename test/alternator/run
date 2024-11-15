@@ -60,6 +60,8 @@ def run_alternator_cmd(pid, dir, seed_ip=''):
         cmd += ['--alternator-port', '8000']
     cmd += extra_scylla_options
     cmd += ['--enable-keyspace-column-family-estimated-row-count', 'true']
+    # for support user level operation metrics
+    cmd += ['--alternator-user-list', 'user1,user2,user3']
 
     return (cmd, env)
 

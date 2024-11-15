@@ -760,7 +760,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<db::system_keyspace
     });
 
     cf::get_true_snapshots_size.set(r, [&ctx] (std::unique_ptr<http::request> req) {
-        auto uuid = get_uuid(req->param["name"], ctx.db.local());
+        auto uuid = get_uuid(req->get_path_param("name"), ctx.db.local());
         return ctx.db.local().find_column_family(uuid).get_snapshot_details().then([](
                 const std::unordered_map<sstring, replica::column_family::snapshot_details>& sd) {
             int64_t res = 0;

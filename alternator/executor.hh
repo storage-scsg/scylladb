@@ -173,7 +173,8 @@ public:
     stats _stats;
     void trace_table_access(
         table_ops_type op, 
-        const std::string& table_name, 
+        const std::string& table_name,
+        std::string user_name,
         const std::chrono::steady_clock::duration& latency = std::chrono::steady_clock::duration::zero()
     );
     static constexpr auto ATTRS_COLUMN_NAME = ":attrs";
@@ -186,9 +187,13 @@ public:
              db::system_distributed_keyspace& sdks,
              cdc::metadata& cdc_metadata,
              smp_service_group ssg,
-             utils::updateable_value<uint32_t> default_timeout_in_ms)
+             utils::updateable_value<uint32_t> default_timeout_in_ms,
+             const std::vector<std::string_view> &user_list = {})
         : _gossiper(gossiper), _proxy(proxy), _mm(mm), _sdks(sdks), _cdc_metadata(cdc_metadata), _ssg(ssg) {
         s_default_timeout_in_ms = std::move(default_timeout_in_ms);
+        for (auto& user : user_list) {
+            s_user_list.insert(sstring(user));
+        }
     }
 
     future<request_return_type> create_table(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request);
@@ -251,6 +256,7 @@ public:
 private:
     static thread_local utils::updateable_value<uint32_t> s_default_timeout_in_ms;
 public:
+    static thread_local std::set<sstring> s_user_list;
     static schema_ptr find_table(service::storage_proxy&, const rjson::value& request);
 
 private:
