@@ -752,6 +752,7 @@ public:
         synctable_option::projection>>;
 
     struct synctable_repair_config {
+        int id; // repair index, which can be used to get repair status.
         synctable_option_set opts;
         sstring target_table_name;
         uint32_t batch_row_limit;
@@ -816,6 +817,14 @@ public:
             return it->second->cfg.synctable_return_code;
         }
         return return_code::ok;
+    }
+
+    inline std::vector<int> get_synctable_repair_ids() {
+        std::vector<int> ids;
+        for (auto& item : _synctable_repair_config_map) {
+            ids.push_back(item.second->cfg.id);
+        }
+        return ids;
     }
 };
 

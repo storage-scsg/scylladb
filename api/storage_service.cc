@@ -46,6 +46,7 @@
 #include "locator/abstract_replication_strategy.hh"
 #include "sstables_loader.hh"
 #include "db/view/view_builder.hh"
+#include "service/storage_proxy.hh"
 
 using namespace seastar::httpd;
 using namespace std::chrono_literals;
@@ -351,6 +352,11 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
     });
 
     ss::get_active_repair_async.set(r, [&repair] (std::unique_ptr<http::request> req) {
+        bool synctable_flag = strcasecmp(req->get_query_param("synctable").c_str(), "true") == 0;
+        if (synctable_flag) {
+            std::vector<int> res = repair.local().get_storage_proxy().local().get_synctable_repair_ids();
+            return make_ready_future<json::json_return_type>(res);
+        }
         return repair.local().get_active_repairs().then([] (std::vector<int> res) {
             return make_ready_future<json::json_return_type>(res);
         });

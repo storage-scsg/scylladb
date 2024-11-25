@@ -1005,7 +1005,16 @@
                "produces":[
                   "application/json"
                ],
-               "parameters":[]
+               "parameters":[
+                  {
+                     "name":"synctable",
+                     "description":"Get synctable repair task only",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
             }
          ]
       },
