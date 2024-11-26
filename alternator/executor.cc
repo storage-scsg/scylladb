@@ -4734,10 +4734,18 @@ void replace_shard_id_to_zero_handler(rjson::value& data) {
 }
 
 bool list_pattern_filter_handler(const rjson::value& data) {
-    // for multiversion bucket metadata list
-    std::regex pattern("^.*\\\\u0000v\\d+\\\\u0000.*");
+    // For multiversion bucket metadata list.
+    // A multiversion bucket will generate three different types of items:
+    // a. instance: "obj": {"S": "\u00001000_4KB-fenhu0514-99992\u0000iNXDsk4zfZdfX"}
+    // b. olh: "obj": {"S": "\u00001001_4KB-fenhu0514-99992"}
+    // c. list: "obj": {"S": "4KB-fenhu0514-99992\u0000v915\u0000iNXDsk4zfZdfX"}
+    // When synchronizing with E3, simply synchronize the list type,
+    // so filter out the other two types of items.
+    // In addition, the situation of multiple buckets for a single table is not affected,
+    // because the user's object will not have strings starting with \u00001000_ or \u00001001_.
+    std::regex pattern("^\"\\\\u0000100[01]_.*");
 
-    return std::regex_match(fmt::format("{}", data), pattern) ? false : true;
+    return std::regex_match(fmt::format("{}", data), pattern) ? true : false;
 }
 
 const std::unordered_map<service::storage_proxy::synctable_column_alter_method, std::function<void(rjson::value&)>> alter_method_map = {
