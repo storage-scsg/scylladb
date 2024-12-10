@@ -270,12 +270,19 @@ filter_for_query(consistency_level cl,
 
     inet_address_vector_replica_set selected_endpoints;
 
+    // if the coordinator is the replica, prefer it
+    inet_address_vector_replica_set inner_preferred_endpoints;
+    if (live_endpoints[0] == utils::fb_utilities::get_broadcast_address()) {
+        inner_preferred_endpoints = preferred_endpoints;
+        inner_preferred_endpoints.push_back(live_endpoints[0]);
+    }
+
     // Pre-select endpoints based on client preference. If the endpoints
     // selected this way aren't enough to satisfy CL requirements select the
     // remaining ones according to the load-balancing strategy as before.
-    if (!preferred_endpoints.empty()) {
-        const auto it = boost::stable_partition(live_endpoints, [&preferred_endpoints] (const gms::inet_address& a) {
-            return std::find(preferred_endpoints.cbegin(), preferred_endpoints.cend(), a) == preferred_endpoints.end();
+    if (!inner_preferred_endpoints.empty()) {
+        const auto it = boost::stable_partition(live_endpoints, [&inner_preferred_endpoints] (const gms::inet_address& a) {
+            return std::find(inner_preferred_endpoints.cbegin(), inner_preferred_endpoints.cend(), a) == inner_preferred_endpoints.end();
         });
         const size_t selected = std::distance(it, live_endpoints.end());
         if (selected >= bf) {
