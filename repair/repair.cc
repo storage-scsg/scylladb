@@ -412,6 +412,10 @@ future<repair_status> repair::task_manager_module::repair_await_completion(int i
             } else {
                 if (it->second == repair_status::FAILED) {
                     return make_ready_future<std::optional<repair_status>>(repair_status::FAILED);
+                } else if (it->second == repair_status::FAILED_500) {
+                    return make_ready_future<std::optional<repair_status>>(repair_status::FAILED_500);
+                } else if (it->second == repair_status::FAILED_400) {
+                    return make_ready_future<std::optional<repair_status>>(repair_status::FAILED_400);
                 } else {
                     return _done_cond.wait(timeout).then([] {
                         return make_ready_future<std::optional<repair_status>>(std::nullopt);
