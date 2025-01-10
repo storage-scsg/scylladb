@@ -1206,6 +1206,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     // 增量修复只针对 alternator 表
     if (!std::string_view(keyspace).starts_with("alternator_") && !std::string_view(keyspace).starts_with("\"alternator_")) {
         options.incremental = false;
+        options_map["incremental"] = "false";
     }
 
     // Note: Cassandra can, in some cases, decide immediately that there is

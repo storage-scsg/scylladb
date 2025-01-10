@@ -65,6 +65,10 @@ struct tombstone final {
     gc_clock::time_point get_deletion_time() const {
         return deletion_time;
     }
+
+    api::timestamp_type get_timestamp() const {
+        return timestamp;
+    }
     
 };
 

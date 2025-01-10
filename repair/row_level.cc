@@ -779,7 +779,7 @@ public:
     using needs_all_rows_t = bool_class<class needs_all_rows_tag>;
     using msg_addr = netw::messaging_service::msg_addr;
     using tracker_link_type = boost::intrusive::list_member_hook<bi::link_mode<boost::intrusive::auto_unlink>>;
-    static constexpr int64_t three_hours_in_us = 3LL * 3600 * 1000000;
+    static uint64_t us_before_repaired_time;
 private:
     repair_service& _rs;
     seastar::sharded<replica::database>& _db;
@@ -844,6 +844,7 @@ private:
     reader_concurrency_semaphore::inactive_read_handle _fake_inactive_read_handle;
     tasks::task_id _repair_task_id;
     bool _incremental = false;
+    boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> _repair_time_map;
 public:
     std::vector<repair_node_state>& all_nodes() {
         return _all_node_states;
@@ -901,7 +902,8 @@ public:
             row_level_repair* row_level_repair_ptr,
             gc_clock::time_point compaction_time,
             tasks::task_id repair_task_id = {},
-            bool incremental = false)
+            bool incremental = false,
+            boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> repair_time_map = {})
             : _rs(rs)
             , _db(rs.get_db())
             , _messaging(rs.get_messaging())
@@ -941,6 +943,7 @@ public:
             , _compaction_time(compaction_time)
             , _repair_task_id(repair_task_id)
             , _incremental(incremental)
+            , _repair_time_map(std::move(repair_time_map))
             {
             if (master) {
                 add_to_repair_meta_for_masters(*this);
@@ -976,9 +979,10 @@ public:
             shard_config master_node_shard_config,
             inet_address_vector_replica_set all_live_peer_nodes,
             gc_clock::time_point compaction_time,
-            bool incremental = false)
+            bool incremental = false,
+            boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> repair_time_map = {})
         : repair_meta(rs, cf, std::move(s), std::move(permit), std::move(range), algo, max_row_buf_size, seed, master, repair_meta_id, reason,
-                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, nullptr, compaction_time, {}, incremental)
+                std::move(master_node_shard_config), std::move(all_live_peer_nodes), 1, nullptr, compaction_time, {}, incremental, std::move(repair_time_map))
     {
     }
 
@@ -1184,12 +1188,28 @@ private:
         cur_rows.push_back(std::move(r));
     }
 
-    void incremental_handle_mutation_fragment(mutation_fragment& mf, size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
-        // 找到 repair_history 对应内存中该表的信息
-        auto& table_id = _schema->id();
-        auto& gc_state = _db.local().get_compaction_manager().get_tombstone_gc_state();
-        auto m = gc_state.get_or_create_repair_history_map_for_table(table_id);
+    bool row_already_repaired(const row& cells, api::timestamp_type repaired_time, column_kind kind) {
+        bool repaired = true;
+        // 如果有一个 cell 的时间戳大于修复时间，那么就说明没有修复过
+        cells.for_each_cell_until([this, &repaired, repaired_time, kind] (column_id id, const atomic_cell_or_collection& c) {
+            auto& column_definition = _schema->column_at(kind, id);
+            if (column_definition.is_atomic()) {
+                if (c.as_atomic_cell(column_definition).timestamp() > repaired_time) {
+                    repaired = false;
+                    return stop_iteration::yes;
+                }
+            } else {
+                if (c.as_collection_mutation().last_update(*column_definition.type) > repaired_time) {
+                    repaired = false;
+                    return stop_iteration::yes;
+                }
+            }
+            return stop_iteration::no;
+        });
+        return repaired;
+    }
 
+    void incremental_handle_mutation_fragment(mutation_fragment& mf, size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
         if (mf.is_partition_start()) {
             auto& start = mf.as_partition_start();
             _repair_reader->set_current_dk(start.key());
@@ -1198,52 +1218,46 @@ private:
                 return;
             }
             // 该分区存在墓碑的情况（一般在只有 pk，没有 sk 的情况下删除会出现）
-            if (m) {
-                // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
-                // 将分区中墓碑的时间与 repair_time - 3h 比较
-                const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
-                if (it != m->map.end() && start.partition_tombstone().get_deletion_time() <= it->second - std::chrono::hours(3)) {
+            // 查找该分区键对应的 token 是否存在于 repair_time_map 中，即是否有过修复历史
+            // 将分区中墓碑的时间与 repair_time - 预留的时间（默认为 3 小时） 比较
+            if (!_repair_time_map.empty()) {
+                const auto it = _repair_time_map.find(_repair_reader->get_current_dk()->dk.token());
+                if (it != _repair_time_map.end() && start.partition_tombstone().get_timestamp() <= std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - us_before_repaired_time) {
                     return;
                 }
             }
         } else if (mf.is_end_of_partition()) {
             _repair_reader->clear_current_dk();
             return;
-        } else if (mf.is_clustering_row() && m) {
-            // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
-            const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
-            if (it != m->map.end()) {
-                // 预留 3 小时避免丢失数据
-                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - three_hours_in_us;
-                auto& clustering_row = mf.as_clustering_row();
-                auto& row_marker = clustering_row.marker();
-                // 获取 LivenessInfo 里的时间戳（如果不存在则为一个负值）
-                auto row_marker_timestamp = row_marker.timestamp();
-                auto row_tombstone = clustering_row.tomb();
-                // 获取 DeletionInfo 里较大的时间戳（如果不存在则为一个负值）
-                auto row_tombstone_timestamp = row_tombstone.max_timestamp();
-                // 如果两个时间戳都小于修复时间，那么跳过这条数据
-                if (row_marker_timestamp <= repaired_time && row_tombstone_timestamp <= repaired_time) {
-                    return;
-                }
-            }
-        } else if (mf.is_static_row() && m) {
-            // 从内存中查找该分区键对应的 token 是否存在于 repair_history 中，即是否有过修复历史
-            const auto it = m->map.find(_repair_reader->get_current_dk()->dk.token());
-            if (it != m->map.end()) {
-                // 预留 3 小时避免丢失数据
-                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - three_hours_in_us;
-                auto& row = mf.as_static_row().cells();
-                bool repaired = true;
-                // 多个 static_row 的情况下会被放到同一个 row 里，只要有一列 static_row 没有被修复过，则整个 static_row 都需要被修复
-                row.for_each_cell([this, &repaired, repaired_time] (column_id id, const atomic_cell_or_collection& c) {
-                    auto&& column_definition = _schema->column_at(column_kind::static_column, id);
-                    if (c.as_atomic_cell(column_definition).timestamp() > repaired_time) {
-                        repaired = false;
+        }
+
+        if (!_repair_time_map.empty()) {
+            // 查找该分区键对应的 token 是否存在于 repair_time_map 中，即是否有过修复历史
+            const auto it = _repair_time_map.find(_repair_reader->get_current_dk()->dk.token());
+            if (it != _repair_time_map.end()) {
+                // 节点之间可能存在时钟漂移问题，以及需要考虑hinted handoff 3小时的延迟问题
+                // 预留时间（默认 3 小时）避免丢失数据
+                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - us_before_repaired_time;
+                if (mf.is_clustering_row()) {
+                    auto& clustering_row = mf.as_clustering_row();
+                    // 获取 LivenessInfo 里的时间戳（如果不存在则为一个负值）
+                    auto row_marker_timestamp = clustering_row.marker().timestamp();
+                    // 获取 DeletionInfo 里较大的时间戳（如果不存在则为一个负值）
+                    auto row_tombstone_timestamp = clustering_row.tomb().max_timestamp();
+                    // 如果两个时间戳都小于修复时间，那么继续判断 cells 里面的时间戳是否都小于修复时间
+                    if (row_marker_timestamp <= repaired_time && row_tombstone_timestamp <= repaired_time) {
+                        auto& cells = clustering_row.cells();
+                        bool repaired = row_already_repaired(cells, repaired_time, column_kind::regular_column);
+                        if (repaired) {
+                            return;
+                        }
                     }
-                });
-                if (repaired) {
-                    return;
+                } else if (mf.is_static_row()) {
+                    auto& cells = mf.as_static_row().cells();
+                    bool repaired = row_already_repaired(cells, repaired_time, column_kind::static_column);
+                    if (repaired) {
+                        return;
+                    }
                 }
             }
         }
@@ -1717,7 +1731,7 @@ public:
 
     // RPC API
     future<>
-    repair_row_level_start(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, table_schema_version schema_version, streaming::stream_reason reason, gc_clock::time_point compaction_time, bool incremental) {
+    repair_row_level_start(gms::inet_address remote_node, sstring ks_name, sstring cf_name, dht::token_range range, table_schema_version schema_version, streaming::stream_reason reason, gc_clock::time_point compaction_time, bool incremental, std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map) {
         if (remote_node == _myip) {
             return make_ready_future<>();
         }
@@ -1731,7 +1745,7 @@ public:
         return _messaging.send_repair_row_level_start(msg_addr(remote_node),
                 _repair_meta_id, ks_name, cf_name, std::move(range), _algo, _max_row_buf_size, _seed,
                 _master_node_shard_config.shard, _master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb,
-                remote_partitioner_name, std::move(schema_version), reason, compaction_time, incremental).then([ks_name, cf_name] (rpc::optional<repair_row_level_start_response> resp) {
+                remote_partitioner_name, std::move(schema_version), reason, compaction_time, incremental, std::move(repaired_info_map)).then([ks_name, cf_name] (rpc::optional<repair_row_level_start_response> resp) {
             if (resp && resp->status == repair_row_level_start_status::no_such_column_family) {
                 return make_exception_future<>(replica::no_such_column_family(ks_name, cf_name));
             } else {
@@ -1745,10 +1759,10 @@ public:
     repair_row_level_start_handler(repair_service& repair, gms::inet_address from, uint32_t src_cpu_id, uint32_t repair_meta_id, sstring ks_name, sstring cf_name,
             dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size,
             uint64_t seed, shard_config master_node_shard_config, table_schema_version schema_version, streaming::stream_reason reason,
-            gc_clock::time_point compaction_time, abort_source& as, bool incremental) {
+            gc_clock::time_point compaction_time, abort_source& as, bool incremental, std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map) {
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
             utils::fb_utilities::get_broadcast_address(), from, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
-        return repair.insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, incremental).then([] {
+        return repair.insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason, compaction_time, as, incremental, std::move(repaired_info_map)).then([] {
             return repair_row_level_start_response{repair_row_level_start_status::ok};
         }).handle_exception_type([] (replica::no_such_column_family&) {
             return repair_row_level_start_response{repair_row_level_start_status::no_such_column_family};
@@ -2691,6 +2705,8 @@ public:
     }
 };
 
+uint64_t repair_meta::us_before_repaired_time = 0;
+
 // Must run inside a seastar thread
 static repair_hash_set
 get_set_diff(const repair_hash_set& x, const repair_hash_set& y) {
@@ -3134,11 +3150,12 @@ future<> repair_service::init_ms_handlers() {
     ms.register_repair_row_level_start([this] (const rpc::client_info& cinfo, uint32_t repair_meta_id, sstring ks_name,
             sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed,
             unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version,
-            rpc::optional<streaming::stream_reason> reason, rpc::optional<gc_clock::time_point> compaction_time, bool incremental) {
+            rpc::optional<streaming::stream_reason> reason, rpc::optional<gc_clock::time_point> compaction_time, bool incremental,
+            std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map) {
         auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
         auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
         return container().invoke_on(src_cpu_id % smp::count, [from, src_cpu_id, repair_meta_id, ks_name, cf_name,
-                range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this, incremental] (repair_service& local_repair) mutable {
+                range, algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, schema_version, reason, compaction_time, this, incremental, repaired_info_map] (repair_service& local_repair) mutable {
             if (!local_repair._sys_dist_ks.local_is_initialized() || !local_repair._view_update_generator.local_is_initialized()) {
                 return make_exception_future<repair_row_level_start_response>(std::runtime_error(format("Node {} is not fully initialized for repair, try again later",
                         utils::fb_utilities::get_broadcast_address())));
@@ -3148,7 +3165,8 @@ future<> repair_service::init_ms_handlers() {
             return repair_meta::repair_row_level_start_handler(local_repair, from, src_cpu_id, repair_meta_id, std::move(ks_name),
                     std::move(cf_name), std::move(range), algo, max_row_buf_size, seed,
                     shard_config{remote_shard, remote_shard_count, remote_ignore_msb},
-                    schema_version, r, ct, _repair_module->abort_source(), incremental);
+                    schema_version, r, ct, _repair_module->abort_source(), incremental,
+                    std::move(repaired_info_map));
         });
     });
     ms.register_repair_row_level_stop([this] (const rpc::client_info& cinfo, uint32_t repair_meta_id,
@@ -3186,6 +3204,8 @@ future<> repair_service::init_ms_handlers() {
         auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
         return repair_flush_hints_batchlog_handler(from, std::move(req));
     });
+
+    repair_meta::us_before_repaired_time = static_cast<uint64_t>(_db.local().get_config().seconds_before_repaired_time()) * 1000000;
 
     return make_ready_future<>();
 }
@@ -3641,6 +3661,25 @@ public:
 
             auto compaction_time = gc_clock::now();
 
+            // 用于存储增量修复对应本轮 token_range 的修复记录，发送给其他从节点
+            std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map;
+            boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> repair_time_map;
+            if (_shard_task.incremental()) {
+                auto& gc_state = _shard_task.rs.get_db().local().get_compaction_manager().get_tombstone_gc_state();
+                auto& table_id = _cf.schema()->id();
+                auto m = gc_state.get_or_create_repair_history_map_for_table(table_id);
+                if (m) {
+                    // 当 token 发生变化时，记录的 token_range 和本轮修复的 token_range 可能不一致
+                    // 需要遍历与本轮修复的 token_range 相交的 token_range
+                    auto range_pair = m->map.equal_range(locator::token_metadata::range_to_interval(_range));
+                    for (auto it = range_pair.first; it != range_pair.second; ++it) {
+                        repaired_info_map[dht::token_range(it->first.lower(), it->first.upper())] = it->second;
+                        // repair_time_map 用于 master 节点存储修复的记录
+                        repair_time_map += make_pair(locator::token_metadata::range_to_interval(nonwrapping_range<dht::token>(it->first.lower(), it->first.upper())), it->second);
+                    }
+                }
+            }
+
             repair_meta master(_shard_task.rs,
                     _cf,
                     s,
@@ -3658,7 +3697,8 @@ public:
                     this,
                     compaction_time,
                     _shard_task.global_repair_id.uuid(),
-                    _shard_task.incremental());
+                    _shard_task.incremental(),
+                    std::move(repair_time_map));
             auto auto_stop_master = defer([&master] {
                 master.stop().handle_exception([] (std::exception_ptr ep) {
                     rlogger.warn("Failed auto-stopping Row Level Repair (Master): {}. Ignored.", ep);
@@ -3675,7 +3715,7 @@ public:
                 parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
                     const auto& node = ns.node;
                     ns.state = repair_state::row_level_start_started;
-                    return master.repair_row_level_start(node, _shard_task.get_keyspace(), _cf_name, _range, schema_version, _shard_task.reason(), compaction_time, _shard_task.incremental()).then([&] () {
+                    return master.repair_row_level_start(node, _shard_task.get_keyspace(), _cf_name, _range, schema_version, _shard_task.reason(), compaction_time, _shard_task.incremental(), repaired_info_map).then([&] () {
                         ns.state = repair_state::row_level_start_finished;
                         nodes_to_stop.push_back(node);
                         ns.state = repair_state::get_estimated_partitions_started;
@@ -3974,7 +4014,8 @@ repair_service::insert_repair_meta(
         streaming::stream_reason reason,
         gc_clock::time_point compaction_time,
         abort_source& as,
-        bool incremental) {
+        bool incremental,
+        std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map) {
     return get_migration_manager().get_schema_for_write(schema_version, {from, src_cpu_id}, get_messaging(), &as).then([this,
             from,
             repair_meta_id,
@@ -3985,7 +4026,8 @@ repair_service::insert_repair_meta(
             master_node_shard_config,
             reason,
             compaction_time,
-            incremental] (schema_ptr s) {
+            incremental,
+            repaired_info_map = std::move(repaired_info_map)] (schema_ptr s) {
         auto& db = get_db();
         return db.local().obtain_reader_permit(db.local().find_column_family(s->id()), "repair-meta", db::no_timeout, {}).then([s = std::move(s),
                 this,
@@ -3998,8 +4040,15 @@ repair_service::insert_repair_meta(
                 master_node_shard_config,
                 reason,
                 compaction_time,
-                incremental] (reader_permit permit) mutable {
+                incremental,
+                repaired_info_map = std::move(repaired_info_map)] (reader_permit permit) mutable {
         node_repair_meta_id id{from, repair_meta_id};
+
+        boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> repair_time_map;
+        for (auto it = repaired_info_map.begin(); it != repaired_info_map.end(); ++it) {
+            repair_time_map += std::make_pair(locator::token_metadata::range_to_interval(nonwrapping_range<dht::token>(it->first.start(), it->first.end())), it->second);
+        }
+        // 从节点的 repair_meta 中也存入 repair_time_map
         auto rm = seastar::make_shared<repair_meta>(*this,
                 get_db().local().find_column_family(s->id()),
                 s,
@@ -4014,7 +4063,8 @@ repair_service::insert_repair_meta(
                 std::move(master_node_shard_config),
                 inet_address_vector_replica_set{from},
                 compaction_time,
-                incremental);
+                incremental,
+                std::move(repair_time_map));
         rm->set_repair_state_for_local_node(repair_state::row_level_start_started);
         bool insertion = repair_meta_map().emplace(id, rm).second;
         if (!insertion) {

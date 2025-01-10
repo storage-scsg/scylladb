@@ -216,7 +216,8 @@ public:
             streaming::stream_reason reason,
             gc_clock::time_point compaction_time,
             abort_source& as,
-            bool incremental);
+            bool incremental,
+            std::unordered_map<dht::token_range, gc_clock::time_point> repaired_info_map);
 
     future<>
     remove_repair_meta(const gms::inet_address& from,
