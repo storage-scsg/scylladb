@@ -1155,13 +1155,27 @@ void view_updates::generate_update(
             return;
         }
         // The view key is necessarily the same pre and post update.
-        if (existing && existing->is_live(*_base)) {
-            if (update.is_live(*_base)) {
-                update_entry(db, base_key, update, *existing, now);
-            } else {
+        if (existing) {
+            if (existing->is_live(*_base)) {
+                if (update.is_live(*_base)) { // 存在旧数据且没有标记为墓碑，更新的数据不为墓碑
+                    update_entry(db, base_key, update, *existing, now);
+                } else { // 存在旧数据且没有标记墓碑，更新的数据为墓碑
+                    delete_old_entry(db, base_key, *existing, update, now);
+                }
+            } else { // 存在旧数据且标记为墓碑
+                if (update.is_live(*_base)) { // 更新的数据不为墓碑
+                    create_entry(db, base_key, update, now);
+                    return;
+                }
+                // =============== 新增逻辑 =====================
+                // 支持删除 base 表中的空数据时更新 view
+                // 场景：扫描 base 表时，发现 base 表中的数据标记为墓碑，应支持对同一对象（obj）进行重复删除操作时，能够传播相应 view 的更新
+                // 即：存在旧数据且标记为墓碑，更新的数据也为墓碑, 应该支持 view 的更新
                 delete_old_entry(db, base_key, *existing, update, now);
             }
-        } else if (update.is_live(*_base)) {
+        } else {
+            // 原逻辑仅支持 不存在旧数据记录时，更新不为墓碑，才更新 view
+            // 现逻辑修改为：不存在旧数据记录时，不管更新是否为墓碑，都更新 view
             create_entry(db, base_key, update, now);
         }
         return;
