@@ -270,10 +270,9 @@ filter_for_query(consistency_level cl,
 
     inet_address_vector_replica_set selected_endpoints;
 
+    inet_address_vector_replica_set inner_preferred_endpoints = preferred_endpoints;
     // if the coordinator is the replica, prefer it
-    inet_address_vector_replica_set inner_preferred_endpoints;
     if (live_endpoints[0] == utils::fb_utilities::get_broadcast_address()) {
-        inner_preferred_endpoints = preferred_endpoints;
         inner_preferred_endpoints.push_back(live_endpoints[0]);
     }
 
