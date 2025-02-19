@@ -3329,6 +3329,31 @@ static db::consistency_level get_read_consistency(const rjson::value& request) {
     return consistent_read ? db::consistency_level::LOCAL_QUORUM : db::consistency_level::LOCAL_ONE;
 }
 
+// Determines the read consistency level based on the provided request consistency level value.
+// Throws an exception if the provided value is not valid according to the consistency map.
+// Parameters:
+// - req_cl: The requested read consistency level value (sstring).
+static db::consistency_level get_read_consistency_from_header(sstring req_cl) {
+    static const std::unordered_map<sstring, db::consistency_level> consistency_map = {
+        {"ONE", db::consistency_level::ONE},
+        {"TWO", db::consistency_level::TWO},
+        {"THREE", db::consistency_level::THREE},
+        {"QUORUM", db::consistency_level::QUORUM},
+        {"ALL", db::consistency_level::ALL},
+        {"LOCAL_ONE", db::consistency_level::LOCAL_ONE},
+        {"LOCAL_QUORUM", db::consistency_level::LOCAL_QUORUM}
+    };
+
+    elogger.trace("req_cl: {}", req_cl);
+
+    auto it = consistency_map.find(req_cl);
+    if (it != consistency_map.end()) {
+        return it->second;
+    } else {
+        throw api_error::validation("ConsistencyLevel header must be either 'ALL', 'QUORUM', 'THREE', 'TWO', 'ONE', 'LOCAL_QUORUM' or 'LOCAL_ONE'");
+    }
+}
+
 // describe_item() wraps the result of describe_single_item() by a map
 // as needed by the GetItem request. It should not be used for other purposes,
 // use describe_single_item() instead.
@@ -3348,17 +3373,21 @@ static rjson::value describe_item(schema_ptr schema,
     return item_descr;
 }
 
-future<executor::request_return_type> executor::get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::get_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, sstring req_cl) {
     _stats.api_operations.get_item++;
     auto start_time = std::chrono::steady_clock::now();
-    elogger.trace("Getting item {}", request);
+    db::consistency_level cl = executor::default_read_consistency_level;
+    if (!req_cl.empty()) {
+        cl = get_read_consistency_from_header(req_cl);
+    }
+    
+    elogger.trace("Getting item {}, consistency_level {}", request, cl);
 
     schema_ptr schema = get_table(_proxy, request);
 
     tracing::add_table_name(trace_state, schema->ks_name(), schema->cf_name());
 
     rjson::value& query_key = request["Key"];
-    db::consistency_level cl = get_read_consistency(request);
 
     partition_key pk = pk_from_json(query_key, schema);
     dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*schema, pk))};
