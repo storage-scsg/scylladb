@@ -2341,7 +2341,7 @@ private:
         if (last_row) {
             compacted_rows.push_back(std::move(*last_row));
         }
-        co_return co_await make_ready_future<>();
+        co_return;
     }
 
     future<sstring> synctable_data_transport(temporary_buffer<char> transport_data, dynamodb::client::opcode_type opcode) {
@@ -2481,7 +2481,7 @@ private:
             }
         }
         if (write_arr.Size() == 0) {
-            co_return co_await make_ready_future<>();
+            co_return;
         }
         temp_data = rjson::print(batch_write_items);
         _metrics.update_synced_row_nr_meta(write_arr.Size(), duplicated_row_nr, temp_data.length());
@@ -2512,27 +2512,34 @@ public:
         rlogger.debug("repair[{}]: synctable_in_repair start with use_working_row_buf {}.", _repair_task_id, use_working_row_buf);
         if (_synctable_flag.has_value()) {
             if (!_synctable_flag.value()) {
-                co_return co_await make_ready_future<>();
+                co_return;
             }
         }
 
         // init synctable param.
         if (!_synctable_flag.has_value()) {
-            const sstring& ks_name = _schema->ks_name();
-            const sstring& cf_name = _schema->cf_name();
-            sstring expected_table_name = ks_name.substr(ks_name.find('_') + 1);
-            // only base table need to be synced (for incremental repair-sync, fully repair-sync need to designate the base table name).
-            if (cf_name != expected_table_name) {
-                _synctable_flag = false;
-                co_return co_await make_ready_future<>();
-            }
-
+            // get config for synctable repair.
             service::storage_proxy& local_sp = _rs.get_storage_proxy().local();
             lw_shared_ptr<service::storage_proxy::synctable_repair_config_pershard> cfg = local_sp.get_synctable_repair_cfg(_repair_task_id);
-            // only normal nodetool repair has no cfg.
             if (!cfg) {
                 _synctable_flag = false;
-                co_return co_await make_ready_future<>();
+                co_return;
+            }
+
+            // only "alternator" base table need to be synced and alternator keyspace must look like "alternator_tablename".
+            const sstring& ks_name = _schema->ks_name();
+            const sstring& cf_name = _schema->cf_name();
+            if (ks_name.starts_with(alternator::executor::KEYSPACE_NAME_PREFIX)) {
+                sstring expected_table_name = ks_name.substr(alternator::executor::KEYSPACE_NAME_PREFIX_LENGTH);
+                if (cf_name != expected_table_name) {
+                    _synctable_flag = false;
+                    co_return;
+                }
+            // if the keyspace is not "alternator", then we do not sync the table.
+            // normally, the non-alternator keyspace repair task will not be added to synctable_repair_cfg.
+            } else {
+                _synctable_flag = false;
+                co_return;
             }
 
             if (!_synctable_common_param) {
@@ -2603,7 +2610,7 @@ public:
 
         std::list<repair_row>& row_buf = use_working_row_buf ?  _working_row_buf : _row_buf;
         if (row_buf.size() == 0) {
-            co_return co_await make_ready_future<>();
+            co_return;
         }
 
         std::vector<future<>> res;
@@ -2646,7 +2653,7 @@ public:
         }
 
         if (res.size() == 0) {
-            co_return co_await make_ready_future<>();
+            co_return;
         }
 
         co_await seastar::when_all_succeed(res.begin(), res.end()).discard_result().handle_exception([this] (std::exception_ptr ep) {
@@ -2680,7 +2687,7 @@ public:
             });
         });
 
-        co_return co_await make_ready_future<>();
+        co_return;
     }
 };
 
