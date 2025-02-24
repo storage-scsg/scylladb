@@ -17,12 +17,13 @@ from util import random_bytes
 def gen_json(n):
     return '{"":'*n + '{}' + '}'*n
 
-def get_signed_request(dynamodb, target, payload):
+def get_signed_request(dynamodb, target, payload, consistency=None):
     # NOTE: Signing routines use boto3 implementation details and may be prone
     # to unexpected changes
     class Request:
         url=dynamodb.meta.client._endpoint.host
         headers={'X-Amz-Target': 'DynamoDB_20120810.' + target, 'Content-Type': 'application/x-amz-json-1.0'}
+        headers.update({'X-Cmss-Consistency': consistency}) if consistency else None
         body=payload.encode(encoding='UTF-8')
         method='POST'
         context={}
@@ -312,3 +313,19 @@ def test_base64_malformed_cond_expr(dynamodb, test_table_b):
             "begins_with(:v, c)"]:
         r = scan_with_binary_data_in_cond_expr(dynamodb, test_table_b, exp, exp_attr)
         assert r.status_code == 400, "Failed on expression \"%s\"" % (exp)
+
+def test_custom_http_head_get(dynamodb, test_table):
+    
+    test_table.put_item(Item={'p': 'x', 'c': 'x', 'big': 'other'})
+
+    payload = '{"TableName": "' + test_table.name + '", "Key": {"p": {"S": "x"}, "c": {"S": "x"}' + '}}'
+    req = get_signed_request(dynamodb, 'GetItem', payload, 'ONE')
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code == 200
+
+    # This test starts a cluster with only one node,
+    # so when the consistency level is TWO, an error will be reported.
+    req = get_signed_request(dynamodb, 'GetItem', payload, 'TWO')
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code != 200
+    assert json.loads(response.text)['message'] == "Internal server error: exceptions::unavailable_exception (Cannot achieve consistency level for cl TWO. Requires 2, alive 1)"
