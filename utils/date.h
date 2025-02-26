@@ -3674,6 +3674,8 @@ public:
         case pm:
             os << "pm";
             break;
+        default:
+            break;
         }
         return os;
     }
@@ -3745,6 +3747,8 @@ public:
             break;
         case pm:
             os << "pm";
+            break;
+        default:
             break;
         }
         return os;
@@ -3824,6 +3828,8 @@ public:
             break;
         case pm:
             os << "pm";
+            break;
+        default:
             break;
         }
         return os;
@@ -3908,6 +3914,8 @@ public:
             break;
         case pm:
             os << "pm";
+            break;
+        default:
             break;
         }
         return os;
