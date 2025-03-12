@@ -427,7 +427,7 @@ public:
 
     named_value<uint32_t> task_ttl_seconds;
     named_value<uint32_t> repair_histroy_ttl_seconds;
-    named_value<uint32_t> seconds_before_repaired_time;
+    named_value<uint32_t> incremental_repair_grace_seconds;
     named_value<uint32_t> nodeops_watchdog_timeout_seconds;
     named_value<uint32_t> nodeops_heartbeat_interval_seconds;
 

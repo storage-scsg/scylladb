@@ -385,3 +385,29 @@ def synctable_test_table2(dynamodb):
     # we create a test_table fixture, we'll choose a different table name
     # anyway.
     table.delete()
+
+@pytest.fixture(scope="session")
+def synctable_test_table3(dynamodb):
+    table = create_test_table(dynamodb,
+        KeySchema=[ { 'AttributeName': 'obj', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'bi', 'KeyType': 'RANGE' }
+        ],
+        AttributeDefinitions=[
+                    { 'AttributeName': 'obj', 'AttributeType': 'S' },
+                    { 'AttributeName': 'bi', 'AttributeType': 'S' },
+        ])
+    yield table
+    table.delete()
+
+@pytest.fixture(scope="session")
+def synctable_test_table4(dynamodb):
+    table = create_test_table(dynamodb,
+        KeySchema=[ { 'AttributeName': 'obj', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'bi', 'KeyType': 'RANGE' }
+        ],
+        AttributeDefinitions=[
+                    { 'AttributeName': 'obj', 'AttributeType': 'S' },
+                    { 'AttributeName': 'bi', 'AttributeType': 'S' },
+        ])
+    yield table
+    table.delete()

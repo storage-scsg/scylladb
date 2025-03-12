@@ -779,7 +779,7 @@ public:
     using needs_all_rows_t = bool_class<class needs_all_rows_tag>;
     using msg_addr = netw::messaging_service::msg_addr;
     using tracker_link_type = boost::intrusive::list_member_hook<bi::link_mode<boost::intrusive::auto_unlink>>;
-    static uint64_t us_before_repaired_time;
+    static uint64_t incremental_repair_grace_us;
 private:
     repair_service& _rs;
     seastar::sharded<replica::database>& _db;
@@ -1222,7 +1222,7 @@ private:
             // 将分区中墓碑的时间与 repair_time - 预留的时间（默认为 3 小时） 比较
             if (!_repair_time_map.empty()) {
                 const auto it = _repair_time_map.find(_repair_reader->get_current_dk()->dk.token());
-                if (it != _repair_time_map.end() && start.partition_tombstone().get_timestamp() <= std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - us_before_repaired_time) {
+                if (it != _repair_time_map.end() && start.partition_tombstone().get_timestamp() <= std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - incremental_repair_grace_us) {
                     return;
                 }
             }
@@ -1237,7 +1237,7 @@ private:
             if (it != _repair_time_map.end()) {
                 // 节点之间可能存在时钟漂移问题，以及需要考虑hinted handoff 3小时的延迟问题
                 // 预留时间（默认 3 小时）避免丢失数据
-                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - us_before_repaired_time;
+                auto repaired_time = std::chrono::duration_cast<std::chrono::microseconds>(it->second.time_since_epoch()).count() - incremental_repair_grace_us;
                 if (mf.is_clustering_row()) {
                     auto& clustering_row = mf.as_clustering_row();
                     // 获取 LivenessInfo 里的时间戳（如果不存在则为一个负值）
@@ -2705,7 +2705,7 @@ public:
     }
 };
 
-uint64_t repair_meta::us_before_repaired_time = 0;
+uint64_t repair_meta::incremental_repair_grace_us = 0;
 
 // Must run inside a seastar thread
 static repair_hash_set
@@ -3205,7 +3205,7 @@ future<> repair_service::init_ms_handlers() {
         return repair_flush_hints_batchlog_handler(from, std::move(req));
     });
 
-    repair_meta::us_before_repaired_time = static_cast<uint64_t>(_db.local().get_config().seconds_before_repaired_time()) * 1000000;
+    repair_meta::incremental_repair_grace_us = static_cast<uint64_t>(_db.local().get_config().incremental_repair_grace_seconds()) * 1000000;
 
     return make_ready_future<>();
 }
@@ -3675,7 +3675,7 @@ public:
                     for (auto it = range_pair.first; it != range_pair.second; ++it) {
                         repaired_info_map[dht::token_range(it->first.lower(), it->first.upper())] = it->second;
                         // repair_time_map 用于 master 节点存储修复的记录
-                        repair_time_map += make_pair(locator::token_metadata::range_to_interval(nonwrapping_range<dht::token>(it->first.lower(), it->first.upper())), it->second);
+                        repair_time_map += make_pair(it->first, it->second);
                     }
                 }
             }
@@ -4046,7 +4046,7 @@ repair_service::insert_repair_meta(
 
         boost::icl::interval_map<dht::token, gc_clock::time_point, boost::icl::partial_absorber, std::less, boost::icl::inplace_max> repair_time_map;
         for (auto it = repaired_info_map.begin(); it != repaired_info_map.end(); ++it) {
-            repair_time_map += std::make_pair(locator::token_metadata::range_to_interval(nonwrapping_range<dht::token>(it->first.start(), it->first.end())), it->second);
+            repair_time_map += std::make_pair(locator::token_metadata::range_to_interval(it->first), it->second);
         }
         // 从节点的 repair_meta 中也存入 repair_time_map
         auto rm = seastar::make_shared<repair_meta>(*this,

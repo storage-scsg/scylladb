@@ -52,6 +52,7 @@ def run_alternator_cmd(pid, dir, seed_ip=''):
         # We only list here Alternator-specific experimental features - CQL
         # ones are listed in test/cql-pytest/run.py.
         '--experimental-features=alternator-streams',
+        '--seconds-before-repaired-time', '0',
     ]
     if '--https' in sys.argv:
         run.setup_ssl_certificate(dir)

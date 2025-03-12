@@ -21,6 +21,8 @@ from conftest import new_dynamodb_session
 import requests
 import json
 import re
+from urllib.parse import urlparse, urlunparse
+import time
 
 def get_current_url(request):
     if request.config.getoption('url') != None:
@@ -28,6 +30,38 @@ def get_current_url(request):
     else:
         url = 'https://localhost:8043' if request.config.getoption('https') else 'http://localhost:8000'
     return url
+
+def get_metrics_url(ip):
+    return f"http://{ip}:9180/metrics"
+
+def get_metrics(url):
+    response = requests.get(url)
+    assert response.status_code == 200
+    return response.text
+
+def get_metric(url, name, requested_labels=None, the_metrics=None):
+    if not the_metrics:
+        the_metrics = get_metrics(url)
+    total = 0.0
+    lines = re.compile('^'+name+'{.*$', re.MULTILINE)
+    for match in re.findall(lines, the_metrics):
+        a = match.split()
+        metric = a[0]
+        val = float(a[1])
+        # Check if match also matches the requested labels
+        if requested_labels:
+            # we know metric begins with name{ and ends with } - the labels
+            # are what we have between those
+            got_labels = metric[len(name)+1:-1].split(',')
+            # Check that every one of the requested labels is in got_labels:
+            for k, v in requested_labels.items():
+                if not f'{k}="{v}"' in got_labels:
+                    # No match for requested label, skip this metric (python
+                    # doesn't have "continue 2" so let's just set val to 0...
+                    val = 0
+                    break
+        total += float(val)
+    return total
 
 module_name = "repair"
 
@@ -115,3 +149,82 @@ def test_synctable_repair_task(synctable_test_table1, synctable_test_table2, res
         if not pos:
             break
     assert count == len(got_items)
+
+def test_incremental_synctable_repair_task(synctable_test_table3, synctable_test_table4, rest_api_wrap_list, request):
+    # embed some data.
+    with synctable_test_table3.batch_writer() as batch:
+        for i in range(100):
+            batch.put_item(Item={
+                'obj': "{}".format(i),
+                'bi': "obj_meta_153e6449-ec57-4819-ab20-93879c2dbb74bucket0317%.1.1.{}".format(i),
+                'attribute': str(i),
+                'another': 'xyz'
+            })
+    time.sleep(1)
+    assert len(rest_api_wrap_list) > 0
+    rest_api_peer = rest_api_wrap_list[0]
+    dest_url = get_current_url(request)
+    dest_url = dest_url.split('//')[1]
+    metrics_url = get_metrics_url(rest_api_peer.host)
+    drain_module_tasks(rest_api_peer, module_name)
+    with set_tmp_task_ttl(rest_api_peer, 1000000000):
+        keyspace = 'alternator_' + synctable_test_table3.name     
+
+        # {trace -> false}, {jobThreads -> 1}, {incremental -> true}, {parallelism -> parallel}
+        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000'})
+        print(resp.text)
+        resp.raise_for_status()
+        sequence_number = resp.json()
+        resp = rest_api_peer.send("GET", f"storage_service/repair_status", { "id": sequence_number })
+        resp.raise_for_status()
+
+        # Get all repairs.
+        statuses = [get_task_status(rest_api_peer, task["task_id"]) for task in list_tasks(rest_api_peer, "repair") if task["sequence_number"] == sequence_number]
+        assert len(statuses) == 1, "Wrong number of internal repair tasks"
+        status = statuses[0]
+        assert status["progress_completed"] == status["progress_total"], "Incorrect task progress"
+
+        assert "children_ids" in status, "Shard tasks weren't created"
+        children = [get_task_status(rest_api_peer, child_id) for child_id in status["children_ids"]]
+        assert all([child["progress_completed"] == child["progress_total"] for child in children]), "Some shard tasks have incorrect progress"
+
+        assert sum([child["progress_total"] for child in children]) == status["progress_total"], "Total progress of parent is not equal to children total progress sum"
+        assert sum([child["progress_completed"] for child in children]) == status["progress_completed"], "Completed progress of parent is not equal to children completed progress sum"
+        assert get_metric(metrics_url, "scylla_repair_synced_row_nr") == 100
+    drain_module_tasks(rest_api_peer, module_name)
+
+    with synctable_test_table3.batch_writer() as batch:
+        for i in range(50):
+            batch.put_item(Item={
+                'obj': "{}".format(i),
+                'bi': "obj_meta_153e6449-ec57-4819-ab20-93879c2dbb74bucket0317%.1.2.{}".format(i),
+                'attribute': str(i),
+                'another': 'xyz'
+            })
+    time.sleep(1)
+    drain_module_tasks(rest_api_peer, module_name)
+    with set_tmp_task_ttl(rest_api_peer, 1000000000):
+        keyspace = 'alternator_' + synctable_test_table3.name
+
+        # {trace -> false}, {jobThreads -> 1}, {incremental -> true}, {parallelism -> parallel}
+        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000'})
+        print(resp.text)
+        resp.raise_for_status()
+        sequence_number = resp.json()
+        resp = rest_api_peer.send("GET", f"storage_service/repair_status", { "id": sequence_number })
+        resp.raise_for_status()
+
+        # Get all repairs.
+        statuses = [get_task_status(rest_api_peer, task["task_id"]) for task in list_tasks(rest_api_peer, "repair") if task["sequence_number"] == sequence_number]
+        assert len(statuses) == 1, "Wrong number of internal repair tasks"
+        status = statuses[0]
+        assert status["progress_completed"] == status["progress_total"], "Incorrect task progress"
+
+        assert "children_ids" in status, "Shard tasks weren't created"
+        children = [get_task_status(rest_api_peer, child_id) for child_id in status["children_ids"]]
+        assert all([child["progress_completed"] == child["progress_total"] for child in children]), "Some shard tasks have incorrect progress"
+
+        assert sum([child["progress_total"] for child in children]) == status["progress_total"], "Total progress of parent is not equal to children total progress sum"
+        assert sum([child["progress_completed"] for child in children]) == status["progress_completed"], "Completed progress of parent is not equal to children completed progress sum"
+        assert get_metric(metrics_url, "scylla_repair_synced_row_nr") == 50
+    drain_module_tasks(rest_api_peer, module_name)
