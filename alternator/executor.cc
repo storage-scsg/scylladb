@@ -1666,7 +1666,7 @@ rmw_operation::returnvalues rmw_operation::parse_returnvalues(const rjson::value
     }
 }
 
-rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& request)
+rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& request, const sstring& write_iso)
     : _request(std::move(request))
     , _schema(get_table(proxy, _request))
     , _write_isolation(get_write_isolation_for_schema(_schema))
@@ -1675,6 +1675,10 @@ rmw_operation::rmw_operation(service::storage_proxy& proxy, rjson::value&& reque
     // _pk and _ck will be assigned later, by the subclass's constructor
     // (each operation puts the key in a slightly different location in
     // the request).
+
+    if (!write_iso.empty()) {
+        _write_isolation = parse_write_isolation(write_iso);
+    }
 }
 
 std::optional<mutation> rmw_operation::apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) {
@@ -1854,8 +1858,8 @@ private:
     put_or_delete_item _mutation_builder;
 public:
     parsed::condition_expression _condition_expression;
-    put_item_operation(service::storage_proxy& proxy, rjson::value&& request)
-        : rmw_operation(proxy, std::move(request))
+    put_item_operation(service::storage_proxy& proxy, rjson::value&& request, const sstring& write_isolation)
+        : rmw_operation(proxy, std::move(request), write_isolation)
         , _mutation_builder(rjson::get(_request, "Item"), schema(), put_or_delete_item::put_item{}) {
         _pk = _mutation_builder.pk();
         _ck = _mutation_builder.ck();
@@ -1905,27 +1909,37 @@ public:
     virtual ~put_item_operation() = default;
 };
 
-future<executor::request_return_type> executor::put_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+static void write_isolation_validation(const sstring& write_isolation) {
+    if (!write_isolation.empty() && !allowed_write_isolation_values.contains(write_isolation)) {
+        throw api_error::validation(format("Invalid value: {} for write isolation level, which should be one of: {}",
+            write_isolation, allowed_write_isolation_values));
+    }
+    return;
+}
+
+future<executor::request_return_type> executor::put_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, sstring write_isolation) {
     _stats.api_operations.put_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("put_item {}", request);
 
-    auto op = make_shared<put_item_operation>(_proxy, std::move(request));
+    write_isolation_validation(write_isolation);
+
+    auto op = make_shared<put_item_operation>(_proxy, std::move(request), write_isolation);
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
     const bool needs_read_before_write = op->needs_read_before_write();
     if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
         _stats.api_operations.put_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
         return container().invoke_on(*shard, _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), write_isolation = std::move(write_isolation)]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), write_isolation = std::move(write_isolation)]
                                      (service::client_state& client_state) mutable {
                 //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
                 // to another shard - once it is solved, this place can use a similar solution. Instead of passing
                 // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
                 // so that it's destructed only after all background operations are finished as well.
-                return e.put_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.put_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), std::move(write_isolation));
             });
         });
     }
@@ -1944,8 +1958,8 @@ private:
     put_or_delete_item _mutation_builder;
 public:
     parsed::condition_expression _condition_expression;
-    delete_item_operation(service::storage_proxy& proxy, rjson::value&& request)
-        : rmw_operation(proxy, std::move(request))
+    delete_item_operation(service::storage_proxy& proxy, rjson::value&& request, const sstring& write_isolation)
+        : rmw_operation(proxy, std::move(request), write_isolation)
         , _mutation_builder(rjson::get(_request, "Key"), schema(), put_or_delete_item::delete_item{}) {
         _pk = _mutation_builder.pk();
         _ck = _mutation_builder.ck();
@@ -1995,27 +2009,29 @@ public:
     virtual ~delete_item_operation() = default;
 };
 
-future<executor::request_return_type> executor::delete_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::delete_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, sstring write_isolation) {
     _stats.api_operations.delete_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("delete_item {}", request);
 
-    auto op = make_shared<delete_item_operation>(_proxy, std::move(request));
+    write_isolation_validation(write_isolation);
+
+    auto op = make_shared<delete_item_operation>(_proxy, std::move(request), write_isolation);
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
     const bool needs_read_before_write = op->needs_read_before_write();
     if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
         _stats.api_operations.delete_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
         return container().invoke_on(*shard, _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), write_isolation = std::move(write_isolation)]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), write_isolation = std::move(write_isolation)]
                                      (service::client_state& client_state) mutable {
                 //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
                 // to another shard - once it is solved, this place can use a similar solution. Instead of passing
                 // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
                 // so that it's destructed only after all background operations are finished as well.
-                return e.delete_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.delete_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), std::move(write_isolation));
             });
         });
     }
@@ -2712,14 +2728,14 @@ public:
 
     parsed::condition_expression _condition_expression;
 
-    update_item_operation(service::storage_proxy& proxy, rjson::value&& request);
+    update_item_operation(service::storage_proxy& proxy, rjson::value&& request, const sstring& write_isolation);
     virtual ~update_item_operation() = default;
     virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const override;
     bool needs_read_before_write() const;
 };
 
-update_item_operation::update_item_operation(service::storage_proxy& proxy, rjson::value&& update_info)
-    : rmw_operation(proxy, std::move(update_info))
+update_item_operation::update_item_operation(service::storage_proxy& proxy, rjson::value&& update_info, const sstring& write_isolation)
+    : rmw_operation(proxy, std::move(update_info), write_isolation)
 {
     const rjson::value* key = rjson::find(_request, "Key");
     if (!key) {
@@ -3276,27 +3292,29 @@ update_item_operation::apply(std::unique_ptr<rjson::value> previous_item, api::t
     return m;
 }
 
-future<executor::request_return_type> executor::update_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::update_item(client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value request, sstring write_isolation) {
     _stats.api_operations.update_item++;
     auto start_time = std::chrono::steady_clock::now();
     elogger.trace("update_item {}", request);
 
-    auto op = make_shared<update_item_operation>(_proxy, std::move(request));
+    write_isolation_validation(write_isolation);
+
+    auto op = make_shared<update_item_operation>(_proxy, std::move(request), write_isolation);
     tracing::add_table_name(trace_state, op->schema()->ks_name(), op->schema()->cf_name());
     const bool needs_read_before_write = op->needs_read_before_write();
     if (auto shard = op->shard_for_execute(needs_read_before_write); shard) {
         _stats.api_operations.update_item--; // uncount on this shard, will be counted in other shard
         _stats.shard_bounce_for_lwt++;
         return container().invoke_on(*shard, _ssg,
-                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit)]
+                [request = std::move(*op).move_request(), cs = client_state.move_to_other_shard(), gt = tracing::global_trace_state_ptr(trace_state), permit = std::move(permit), write_isolation = std::move(write_isolation)]
                 (executor& e) mutable {
-            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt)]
+            return do_with(cs.get(), [&e, request = std::move(request), trace_state = tracing::trace_state_ptr(gt), write_isolation = std::move(write_isolation)]
                                      (service::client_state& client_state) mutable {
                 //FIXME: A corresponding FIXME can be found in transport/server.cc when a message must be bounced
                 // to another shard - once it is solved, this place can use a similar solution. Instead of passing
                 // empty_service_permit() to the background operation, the current permit's lifetime should be prolonged,
                 // so that it's destructed only after all background operations are finished as well.
-                return e.update_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request));
+                return e.update_item(client_state, std::move(trace_state), empty_service_permit(), std::move(request), std::move(write_isolation));
             });
         });
     }

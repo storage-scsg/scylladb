@@ -82,7 +82,7 @@ public:
     // The constructor of a rmw_operation subclass should parse the request
     // and try to discover as many input errors as it can before really
     // attempting the read or write operations.
-    rmw_operation(service::storage_proxy& proxy, rjson::value&& request);
+    rmw_operation(service::storage_proxy& proxy, rjson::value&& request, const sstring& write_iso);
     // rmw_operation subclasses (update_item_operation, put_item_operation
     // and delete_item_operation) shall implement an apply() function which
     // takes the previous value of the item (if it was read) and creates the

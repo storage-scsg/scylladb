@@ -36,6 +36,7 @@ namespace alternator {
 
 static constexpr auto TARGET = "X-Amz-Target";
 static constexpr auto CONSISTENCY = "X-Cmss-Consistency";
+static constexpr auto WRITE_ISOLATION = "X-Cmss-Write-Isolation";
 
 // Handle CORS (Cross-origin resource sharing) in the HTTP request:
 // If the request has the "Origin" header specifying where the script which
@@ -545,16 +546,16 @@ server::server(executor& exec, service::storage_proxy& proxy, gms::gossiper& gos
             return e.update_table(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
         }},
         {"PutItem", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
-            return e.put_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
+            return e.put_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request), req->get_header(WRITE_ISOLATION));
         }},
         {"UpdateItem", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
-            return e.update_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
+            return e.update_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request), req->get_header(WRITE_ISOLATION));
         }},
         {"GetItem", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.get_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request), req->get_header(CONSISTENCY));
         }},
         {"DeleteItem", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
-            return e.delete_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
+            return e.delete_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request), req->get_header(WRITE_ISOLATION));
         }},
         {"ListTables", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.list_tables(client_state, std::move(permit), std::move(json_request));
