@@ -71,10 +71,6 @@ void large_data_handler::unplug_system_keyspace() noexcept {
     _sys_ks = nullptr;
 }
 
-template <typename T> static std::string key_to_str(const T& key, const schema& s) {
-    return fmt::to_string(key.with_schema(s));
-}
-
 sstring large_data_handler::sst_filename(const sstables::sstable& sst) {
     return sst.component_basename(sstables::component_type::Data);
 }
@@ -204,14 +200,63 @@ future<> cql_table_large_data_handler::internal_record_large_cells_and_collectio
     }
 }
 
+future<> cql_table_large_data_handler::fetch_all_large_rows(const std::string& keyspace_name, const std::string& table_name, const std::string& partition_key, const std::string& clustering_key) const {
+    // 如果 keyspace_name, table_name 以及 pk ck 一致，则表明是相同行，但可能存放在多个 sstable 中，需要累加
+    // 因此，获取当前 compact 中同一个 large_row 的所有记录，对 row_size 进行累加
+    const std::string query = format("SELECT * FROM system.large_rows WHERE keyspace_name = ? AND table_name = ? AND partition_key = ? AND clustering_key = ? ALLOW FILTERING");
+    auto result = co_await _sys_ks->execute_cql(query, keyspace_name, table_name, partition_key, clustering_key);
+
+    // 如果结果为空，直接返空
+    if (result->empty()) {
+        large_data_logger.debug("No large row record in system.large_rows.");
+        co_return;
+    }
+
+    // Record pk + ck as a string to distinguish different row
+    auto pk_ck = partition_key + ", " + clustering_key;
+
+    // 对 row_size 进行累加后, 更新 large row 的大小
+    int64_t large_row_size = 0;
+    for (const auto& row : *result) {
+        large_row_size += row.get_as<int64_t>("row_size");
+    }
+
+    // 如果是新 table，添加到 large_rows 中, 并初始化指标
+    // 为了控制 large_rows 的存储空间消耗，仅记录每张表的一行 large row 信息
+    if (!large_rows.contains(table_name)) {
+        large_rows[table_name][pk_ck] = 0; // 初始化指标值为 0
+        large_data_handler::add_large_row_metrics(table_name, pk_ck);
+    } else if (large_rows.contains(table_name) && !large_rows[table_name].contains(pk_ck)) {
+        // 每张表仅存储一条最新的 large row 记录, 如已有记录，则删除旧纪录
+        large_rows[table_name].clear();
+        large_rows[table_name][pk_ck] = 0; // 初始化指标值为 0
+    }
+
+    large_rows[table_name][pk_ck] = large_row_size;
+    large_data_logger.debug("Large row info - Table_name: {}, Row Size: {}", table_name, large_row_size);
+
+    co_return;
+}
+
 future<> cql_table_large_data_handler::record_large_rows(const sstables::sstable& sst, const sstables::key& partition_key,
         const clustering_key_prefix* clustering_key, uint64_t row_size) const {
     static const std::vector<sstring> extra_fields{"clustering_key"};
+    _stats.rows_bigger_than_threshold++;
+    const schema &s = *sst.get_schema();
+    std::string pk_str = key_to_str(partition_key.to_partition_key(s), s);
+
     if (clustering_key) {
-        const schema &s = *sst.get_schema();
         std::string ck_str = key_to_str(*clustering_key, s);
+        // clustering_row 相关的 large_row 信息
+        auto defer = seastar::defer([&s, this, pk_str, ck_str] {
+            cql_table_large_data_handler::fetch_all_large_rows(s.ks_name(), s.cf_name(), pk_str, ck_str).get();
+        });
         return try_record("row", sst, partition_key, int64_t(row_size), "row", "", extra_fields, ck_str);
     } else {
+        // static_row 相关的 large_row 信息
+        auto defer = seastar::defer([&s, this, pk_str] {
+            cql_table_large_data_handler::fetch_all_large_rows(s.ks_name(), s.cf_name(), pk_str).get();
+        });
         return try_record("row", sst, partition_key, int64_t(row_size), "static row", "", extra_fields, data_value::make_null(utf8_type));
     }
 }

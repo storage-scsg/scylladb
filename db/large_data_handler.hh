@@ -13,6 +13,10 @@
 #include "system_keyspace.hh"
 #include "sstables/shared_sstable.hh"
 #include "utils/updateable_value.hh"
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/core/metrics.hh>
+#include "cql3/untyped_result_set.hh"
+#include "sstables/sstables.hh"
 
 namespace sstables {
 class sstable;
@@ -21,13 +25,36 @@ class key;
 
 namespace db {
 
+template <typename T> static std::string key_to_str(const T& key, const schema& s) {
+    return fmt::to_string(key.with_schema(s));
+}
+
 class system_keyspace;
 
 class large_data_handler {
 public:
     struct stats {
         int64_t partitions_bigger_than_threshold = 0; // number of large partition updates exceeding threshold_bytes
+        int64_t rows_bigger_than_threshold = 0; // number of large row updates exceeding threshold_bytes
     };
+
+    // In order to optimize memory usage and prevent excessive memory consumption,
+    // here only retore neccessary information
+    // table_name → (pk_ck, row_size)
+    mutable std::unordered_map<std::string, std::unordered_map<std::string, int64_t>> large_rows;
+
+    void add_large_row_metrics(std::string table_name, std::string pk_ck) const {
+        namespace sm = seastar::metrics;
+        static sm::label column_family_label("table");
+
+        _metrics.add_group("database", {
+            sm::make_gauge("large_rows_info", large_rows[table_name][pk_ck],
+            sm::description("Row size of the newest large row in a table."),
+            {column_family_label(table_name)})
+            .aggregate({sm::shard_label})
+            .set_skip_when_empty(),
+        });
+    }
 
 private:
     // Assuming:
@@ -60,12 +87,11 @@ protected:
     uint64_t _cell_threshold_bytes;
     uint64_t _rows_count_threshold;
     uint64_t _collection_elements_count_threshold;
-
-private:
     mutable large_data_handler::stats _stats;
 
 protected:
     seastar::shared_ptr<db::system_keyspace> _sys_ks;
+    mutable seastar::metrics::metric_groups _metrics;
 
 public:
     explicit large_data_handler(uint64_t partition_threshold_bytes, uint64_t row_threshold_bytes, uint64_t cell_threshold_bytes, uint64_t rows_count_threshold, uint64_t collection_elements_count_threshold);
@@ -76,6 +102,28 @@ public:
     void start();
     future<> stop();
 
+    future<bool> reset_large_row_size(const sstables::sstable& sst, const sstables::key& partition_key,
+            const clustering_key_prefix* clustering_key, uint64_t row_size) {
+        assert(running());
+        const schema &s = *sst.get_schema();
+
+        std::string pk_str = key_to_str(partition_key.to_partition_key(s), s);
+        // 如果是 clustering key 则将其转换为 string; 如果是 static row, 则应该为空
+        std::string ck_str = clustering_key ? key_to_str(*clustering_key, s) : "";
+        auto pk_ck = pk_str + ", " + ck_str;
+
+        if (large_rows[s.cf_name()].contains(pk_ck)) {
+            const std::string query = format("SELECT * FROM system.large_rows WHERE keyspace_name = ? AND table_name = ? AND partition_key = ? AND clustering_key = ? ALLOW FILTERING");
+            auto result = _sys_ks->execute_cql(query, s.ks_name(), s.cf_name(), pk_str, ck_str).get();
+
+            // 如果结果为空，说明该 large row 已经被更新过，不存在了；否则保留原来的值
+            if (result->empty()) {
+                large_rows[s.cf_name()][pk_ck] = 0;
+            }
+        }
+        return make_ready_future<bool>(false);
+    }
+
     future<bool> maybe_record_large_rows(const sstables::sstable& sst, const sstables::key& partition_key,
             const clustering_key_prefix* clustering_key, uint64_t row_size) {
         assert(running());
@@ -85,6 +133,8 @@ public:
             }).then([] {
                 return true;
             });
+        } else { // 重置不存在的 large row size
+            return reset_large_row_size(sst, partition_key, clustering_key, row_size);
         }
         return make_ready_future<bool>(false);
     }
@@ -169,6 +219,7 @@ protected:
     virtual future<> record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
             const clustering_key_prefix* clustering_key, const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements) const override;
     virtual future<> record_large_rows(const sstables::sstable& sst, const sstables::key& partition_key, const clustering_key_prefix* clustering_key, uint64_t row_size) const override;
+    future<> fetch_all_large_rows(const std::string& keyspace_name, const std::string& table_name, const std::string& partition_key, const std::string& clustering_key = "") const;
 
 private:
     future<> internal_record_large_cells(const sstables::sstable& sst, const sstables::key& partition_key,
