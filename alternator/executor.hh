@@ -179,7 +179,7 @@ public:
     );
     static constexpr auto ATTRS_COLUMN_NAME = ":attrs";
     static constexpr auto KEYSPACE_NAME_PREFIX = "alternator_";
-    static constexpr size_t KEYSPACE_NAME_PREFIX_LENGTH = sizeof(KEYSPACE_NAME_PREFIX) - 1;
+    static constexpr size_t KEYSPACE_NAME_PREFIX_LENGTH = std::string_view(KEYSPACE_NAME_PREFIX).length();
     static constexpr std::string_view INTERNAL_TABLE_PREFIX = ".scylla.alternator.";
 
     executor(gms::gossiper& gossiper,
