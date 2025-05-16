@@ -17,13 +17,13 @@ from util import random_bytes
 def gen_json(n):
     return '{"":'*n + '{}' + '}'*n
 
-def get_signed_request(dynamodb, target, payload, consistency=None):
+def get_signed_request(dynamodb, target, payload, custom_headers=None):
     # NOTE: Signing routines use boto3 implementation details and may be prone
     # to unexpected changes
     class Request:
         url=dynamodb.meta.client._endpoint.host
         headers={'X-Amz-Target': 'DynamoDB_20120810.' + target, 'Content-Type': 'application/x-amz-json-1.0'}
-        headers.update({'X-Cmss-Consistency': consistency}) if consistency else None
+        headers.update(custom_headers) if custom_headers else None
         body=payload.encode(encoding='UTF-8')
         method='POST'
         context={}
@@ -319,13 +319,60 @@ def test_custom_http_head_get(dynamodb, test_table):
     test_table.put_item(Item={'p': 'x', 'c': 'x', 'big': 'other'})
 
     payload = '{"TableName": "' + test_table.name + '", "Key": {"p": {"S": "x"}, "c": {"S": "x"}' + '}}'
-    req = get_signed_request(dynamodb, 'GetItem', payload, 'ONE')
+    req = get_signed_request(dynamodb, 'GetItem', payload, {'X-Cmss-Consistency': 'ONE'})
     response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
     assert response.status_code == 200
 
     # This test starts a cluster with only one node,
     # so when the consistency level is TWO, an error will be reported.
-    req = get_signed_request(dynamodb, 'GetItem', payload, 'TWO')
+    req = get_signed_request(dynamodb, 'GetItem', payload, {'X-Cmss-Consistency': 'TWO'})
     response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
     assert response.status_code != 200
     assert json.loads(response.text)['message'] == "Internal server error: exceptions::unavailable_exception (Cannot achieve consistency level for cl TWO. Requires 2, alive 1)"
+
+# http write isolation header test for put, update and delete with isolation "forbid", "always", "only_rmw_uses_lwt" and "unsafe"
+
+def test_custom_write_isolation_header(dynamodb, test_table):
+    # non lwt payload
+    non_lwt_payload = json.dumps({
+        "TableName": test_table.name,
+        "Item": {
+            "p": {"S": "x"},
+            "c": {"S": "x"},
+            "big": {"S": "other"}
+        }
+    })
+
+    # lwt payload
+    lwt_payload = json.dumps({
+        "TableName": test_table.name,
+        "Item": {
+            "p": {"S": "x"},
+            "c": {"S": "x"},
+            "big": {"S": "other"}
+        }, 
+        "ReturnValues": "ALL_OLD"
+    })
+
+    # forbid iso test
+    req = get_signed_request(dynamodb, 'PutItem', non_lwt_payload, {'X-Cmss-Write-Isolation': 'forbid'})
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code == 200
+
+    req = get_signed_request(dynamodb, 'PutItem', lwt_payload, {'X-Cmss-Write-Isolation': 'forbid'})
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code != 200
+
+    # unsafe iso test
+    req = get_signed_request(dynamodb, 'PutItem', lwt_payload, {'X-Cmss-Write-Isolation': 'unsafe'})
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code == 200
+
+    # unexpected situation test, use table's default isolation level
+    req = get_signed_request(dynamodb, 'PutItem', lwt_payload, {'X-Cmss-Write-Isolation': ''})
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code == 200
+
+    req = get_signed_request(dynamodb, 'PutItem', lwt_payload, {'X-Cmss-Write-Isolation': 'forbiden'})
+    response = requests.post(req.url, headers=req.headers, data=req.body, verify=True)
+    assert response.status_code != 200
