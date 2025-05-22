@@ -29,7 +29,7 @@ import time
 from contextlib import contextmanager
 from botocore.exceptions import ClientError
 
-from util import random_string, new_test_table, is_aws
+from util import random_string, new_test_table, is_aws, random_bytes
 from conftest import filled_test_table, adjust_gc_grace_seconds_of_table
 
 import json
@@ -382,3 +382,36 @@ def test_alternator_user_metrics(dynamodb, test_table_s, metrics):
     assert count == 0
     count = get_metric(metrics, 'scylla_alternator_table_op_latency_bucket', {'op': 'PutItem'}, the_metrics)
     assert count != 0
+
+def update_item_for_large_row(table):
+    p = "large_row_test"
+    c = "large_row_test"
+    attr = random_bytes(409600)
+    for i in range(100) :
+        table.update_item(Key={'p': p, 'c': c}, UpdateExpression='SET attr' + str(i) + ' = :val1', ExpressionAttributeValues={':val1': attr})
+
+def delete_item_for_large_row(table):
+    table.delete_item(Key={'p': "large_row_test", 'c': "large_row_test"})
+
+def test_large_rows(dynamodb, metrics, rest_api):
+    with new_test_table(dynamodb,
+            KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
+            AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'S' } ]) as table:
+
+        # Test large row exists in table
+        update_item_for_large_row(table)
+        requests.post(rest_api+'/storage_service/keyspace_flush/alternator_'+table.name, params={'cf' : table.name})
+        requests.post(rest_api+'/storage_service/keyspace_compaction/alternator_'+table.name, params={'cf' : table.name})
+        time.sleep(1)
+        the_metrics = get_metrics(metrics)
+        large_row_size = { table.name: get_metric(metrics, 'scylla_database_large_rows_info', {'table': table.name}, the_metrics) }
+        assert large_row_size[table.name] != 0
+
+        # Test when large row does not exit in table whether metric value is reset to be 0 or not
+        delete_item_for_large_row(table)
+        requests.post(rest_api+'/storage_service/keyspace_flush/alternator_'+table.name, params={'cf' : table.name})
+        requests.post(rest_api+'/storage_service/keyspace_compaction/alternator_'+table.name, params={'cf' : table.name})
+        time.sleep(1)
+        the_metrics = get_metrics(metrics)
+        large_row_size = { table.name: get_metric(metrics, 'scylla_database_large_rows_info', {'table': table.name}, the_metrics) }
+        assert large_row_size[table.name] == 0
