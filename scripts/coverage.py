@@ -67,7 +67,7 @@ def run(args, executable=None, distinct_id=None):
         pass # allow process to be shut down with ^C
 
 
-def generate_coverage_report(path="build/coverage/test", name="tests", input_files=None, verbose=0):
+def generate_coverage_report(path="build/coverage/test", name="tests", input_files=None, verbose=0, report_format="html"):
     """Generate a html coverage report from the given profiling data
 
     Arguments:
@@ -150,8 +150,21 @@ def generate_coverage_report(path="build/coverage/test", name="tests", input_fil
     with open(info_path, "w") as f:
         maybe_print(f"Exporting in lcov format to {info_path}")
         subprocess.check_call(["llvm-cov", "export", "-format=lcov", f"-instr-profile={profdata_path}"] + [f"-object={exe}" for exe in test_executables], stdout=f)
+    
+    if report_format == "xml":
+        xml_report_path = os.path.join(path, "coverage.xml")
+        xml_report_url = os.path.abspath(xml_report_path)
 
+        maybe_print(f"Generating xml report in {xml_report_path}")
+        
+        subprocess.check_call(["lcov_cobertura", info_path, "-o", xml_report_path])
+
+        print(f"Coverage report written to {xml_report_path}, url: file://{xml_report_url}")
+
+        return xml_report_path
+    
     html_report_path = os.path.join(path, f"{name}")
+    os.makedirs(html_report_path, exist_ok=True)
     html_report_url = os.path.abspath(os.path.join(html_report_path, "index.html"))
 
     maybe_print(f"Generating html report in {html_report_path}")
@@ -205,6 +218,7 @@ def main(argv):
     arg_parser.add_argument("--name", dest="name", action="store", type=Value, required=False, default=Value("tests", is_default=True), help="defaults to 'tests', with --run it defaults to the name of the provided executable")
     arg_parser.add_argument("--input-files", dest="input_files", nargs='+', action="extend", type=str, required=False)
     arg_parser.add_argument("--verbose", "-v", dest="verbose", action="count", required=False, default=0, help="defaults to not verbose")
+    arg_parser.add_argument("--report-format", "-r", dest="report_format", action="store", type=str, required=False, choices=["html", "xml"], default="html", help="the format of the generated coverage report, defaults to 'html'")
     arg_parser.add_argument("--run", dest="run", action="store_true", required=False,
             help="run the specified executable and generate the coverage report, all command line arguments after --run are considered to be part of the to-be-run test")
     arg_parser.add_argument("--no-coverage-report", dest="no_coverage_report", action="store_true", required=False, default=False,
@@ -244,7 +258,7 @@ def main(argv):
         else:
             print("Ignoring --no-coverage-report as --run was not provided")
 
-    generate_coverage_report(args.path, args.name.val, input_files, args.verbose)
+    generate_coverage_report(args.path, args.name.val, input_files, args.verbose, args.report_format)
 
 
 if __name__ == "__main__":

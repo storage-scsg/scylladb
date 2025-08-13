@@ -368,6 +368,7 @@ Install dependencies:
 
     $ dnf install llvm # for llvm-profdata and llvm-cov
     $ dnf install lcov # for genhtml
+    $ pip install lcov_cobertura # for convert to xml
 
 Instruct `configure.py` to generate build files for `coverage` mode:
 

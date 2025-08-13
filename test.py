@@ -1241,6 +1241,8 @@ def parse_cmd_line() -> argparse.Namespace:
                              "is only supported by python tests for now, other tests ignore it. "
                              "By default, the marker filter is not applied and all tests will be run without exception."
                              "To exclude e.g. slow tests you can write --markers 'not slow'.")
+    parser.add_argument("--report-format", "-r", dest="report_format", action="store", type=str, required=False, choices=["html", "xml"], default="html",
+                        help="the format of the generated coverage report, defaults to 'html'")
 
     scylla_additional_options = parser.add_argument_group('Additional options for Scylla tests')
     scylla_additional_options.add_argument('--x-log2-compaction-groups', action="store", default="0", type=int,
@@ -1602,7 +1604,7 @@ async def main() -> int:
         write_consolidated_boost_junit_xml(options.tmpdir, mode)
 
     if 'coverage' in options.modes:
-        coverage.generate_coverage_report("build/coverage", "tests")
+        coverage.generate_coverage_report("build/coverage", "tests", report_format=options.report_format)
 
     # Note: failure codes must be in the ranges 0-124, 126-127,
     #       to cooperate with git bisect's expectations
