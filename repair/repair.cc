@@ -1201,6 +1201,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     auto germs = make_lw_shared(co_await locator::make_global_effective_replication_map(sharded_db, keyspace));
     auto& erm = germs->get();
     auto& topology = erm.get_token_metadata().get_topology();
+    service::storage_proxy::synctable_repair_config cfg;
 
     repair_options options(options_map);
     // 增量修复只针对 alternator 表
@@ -1251,7 +1252,6 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
             }
         }
 
-        service::storage_proxy::synctable_repair_config cfg;
         cfg.target_table_name = options.target_table_name;
         cfg.read_before_write = options.read_before_write;
 
@@ -1373,16 +1373,7 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
             cfg.expected_transport_latency = expected_transport_latency;
         }
 
-        if (_sp.local()._synctable_repair_config_map.size() == 1) {
-            throw std::runtime_error("only one synctable repair is allowed at the same time.");
-        }
-
-        cfg.id = id.id;
-        co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
-            return sp.insert_synctable_repair_cfg(repair_uuid, cfg);
-        });
-        rlogger.info("repair[{}]: config inserted successfully, ready to sync table during repair with http_conn_resource as {} and expected_transport_latency as {}ms.",
-            id.uuid(), cfg.http_conn_resource, cfg.expected_transport_latency);
+        cfg.id = id.id;       
     }
 
     // If the "ranges" option is not explicitly specified, we repair all the
@@ -1471,6 +1462,11 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     }
 
     auto ranges_parallelism = options.ranges_parallelism == -1 ? std::nullopt : std::optional<int>(options.ranges_parallelism);
+    co_await _sp.invoke_on_all([repair_uuid = id.uuid(), cfg = std::move(cfg)] (service::storage_proxy& sp) {
+        return sp.insert_synctable_repair_cfg(repair_uuid, cfg);
+    });
+    rlogger.info("repair[{}]: config inserted successfully, ready to sync table during repair with http_conn_resource as {} and expected_transport_latency as {}ms.",
+        id.uuid(), cfg.http_conn_resource, cfg.expected_transport_latency);
     auto task = co_await _repair_module->make_and_start_task<repair::user_requested_repair_task_impl>({}, id, std::move(keyspace), "", germs, std::move(cfs), std::move(ranges), std::move(options.hosts), std::move(options.data_centers), std::move(ignore_nodes), ranges_parallelism, options.incremental);
     co_return id.id;
 }
