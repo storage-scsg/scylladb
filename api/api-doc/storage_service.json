@@ -1276,6 +1276,23 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"yes_i_really_really_mean_it",
+                     "description":"Must be set to 'true' to confirm you understand this operation should only be used in extreme scenarios (e.g., critical data inconsistency).",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"reason",
+                     "description":"Brief description of the extreme scenario requiring this repair (e.g., 'name_reasone_xxx').",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query",
+                     "minLength":20
                   }
                ]
             },

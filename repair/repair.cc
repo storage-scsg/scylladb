@@ -833,6 +833,7 @@ struct repair_options {
     int ranges_parallelism = -1;
     // for synctable repair
     sstring target_table_name;
+    sstring reason;
     std::vector<sstring> target_table_keys;
     std::vector<sstring> ipports;
     std::vector<sstring> projections;
@@ -845,6 +846,7 @@ struct repair_options {
     int max_connections = 0;
     uint32_t peer_ops = 0;
     bool incremental = false;
+    bool yes_i_really_really_mean_it = false;
 
     repair_options(std::unordered_map<sstring, sstring> options) {
         bool_opt(primary_range, options, PRIMARY_RANGE_KEY);
@@ -855,6 +857,7 @@ struct repair_options {
         list_opt(data_centers, options, DATACENTERS_KEY);
         // for synctable repair
         string_opt(target_table_name, options, TARGET_TABLE_NAME_KEY);
+        string_opt(reason, options, SYNC_TABLE_REASON_KEY);
         list_opt(target_table_keys, options, TARGET_TABLE_KEY_LIST_KEY);
         list_opt(ipports, options, IP_PORT_LIST_KEY);
         list_opt(projections, options, PROJECTION_LIST_KEY);
@@ -864,6 +867,7 @@ struct repair_options {
         list_opt(column_filter_method, options, COLUMN_FILTER_METHOD_LIST_KEY);
         int_opt(batch_row_limit, options, BATCH_ROW_LIMIT_INT_KEY);
         bool_opt(read_before_write, options, READ_BEFORE_WRITE_BOOL_KEY);
+        bool_opt(yes_i_really_really_mean_it, options, YES_I_REALLY_REALLY_MEAN_IT_BOOL_KEY);
         int_opt(max_connections, options, MAX_CONNECTIONS_INT_KEY);
         ulint_opt(peer_ops, options, PEER_OPS_ULLINT_KEY);
         // We currently do not support incremental repair. We could probably
@@ -926,6 +930,8 @@ struct repair_options {
     static constexpr const char* READ_BEFORE_WRITE_BOOL_KEY = "read_before_write";
     static constexpr const char* MAX_CONNECTIONS_INT_KEY = "max_connections";
     static constexpr const char* PEER_OPS_ULLINT_KEY = "peer_ops";
+    static constexpr const char* YES_I_REALLY_REALLY_MEAN_IT_BOOL_KEY = "yes_i_really_really_mean_it";
+    static constexpr const char* SYNC_TABLE_REASON_KEY = "reason";
 
     // Settings of "parallelism" option. Numbers must match Cassandra's
     // RepairParallelism enum, which is used by the caller.
@@ -1228,6 +1234,14 @@ future<int> repair_service::do_repair_start(sstring keyspace, std::unordered_map
     }
 
     // synctable repair config
+    if (!options.yes_i_really_really_mean_it) {
+        throw std::runtime_error("Operation denied: This API is for extreme scenarios only. Set 'yes_i_really_really_mean_it=true' to confirm.");
+    }
+
+    if (options.reason.size() < 20) {
+        throw std::runtime_error("Please provide a meaningful reason (at least 20 characters) explaining the extreme scenario.");
+    }
+
     if (options.target_table_name != "") {
         // support alternator only right now.
         if (!keyspace.starts_with("alternator_") && !keyspace.starts_with("\"alternator_")) {

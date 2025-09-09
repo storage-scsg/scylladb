@@ -118,7 +118,7 @@ def test_synctable_repair_task(synctable_test_table1, synctable_test_table2, res
             dest_url = dest_url.split('//')[1]
 
             # {trace -> false}, {jobThreads -> 1}, {incremental -> false}, {parallelism -> parallel}
-            resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'true', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'false', 'parallelism' : 'parallel', 'target_table': synctable_test_table2.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table1.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000'})
+            resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'true', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'false', 'parallelism' : 'parallel', 'target_table': synctable_test_table2.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table1.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000', 'yes_i_really_really_mean_it': 'true', 'reason': 'pytest_reasone_for_test'})
             print(resp.text)
             resp.raise_for_status()
             sequence_number = resp.json()
@@ -171,7 +171,7 @@ def test_incremental_synctable_repair_task(synctable_test_table3, synctable_test
         keyspace = 'alternator_' + synctable_test_table3.name     
 
         # {trace -> false}, {jobThreads -> 1}, {incremental -> true}, {parallelism -> parallel}
-        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000'})
+        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000', 'yes_i_really_really_mean_it': 'true', 'reason': 'pytest_reasone_for_test'})
         print(resp.text)
         resp.raise_for_status()
         sequence_number = resp.json()
@@ -207,7 +207,7 @@ def test_incremental_synctable_repair_task(synctable_test_table3, synctable_test
         keyspace = 'alternator_' + synctable_test_table3.name
 
         # {trace -> false}, {jobThreads -> 1}, {incremental -> true}, {parallelism -> parallel}
-        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000'})
+        resp = rest_api_peer.send("POST", f"storage_service/repair_async/{keyspace}", {'primaryRange' : 'false', 'trace' : 'false', 'jobThreads' : '1', 'incremental' : 'true', 'parallelism' : 'parallel', 'target_table': synctable_test_table4.name, 'ips': dest_url, 'projection': 'obj,bi', 'column_alter': 'bi', 'column_alter_method': 'replace_shard_id_to_zero', 'columnFamilies' : synctable_test_table3.name, 'batch_row_limit' : '20', 'max_connections' : '10', 'peer_ops' : '2000', 'yes_i_really_really_mean_it': 'true', 'reason': 'pytest_reasone_for_test'})
         print(resp.text)
         resp.raise_for_status()
         sequence_number = resp.json()
